@@ -200,7 +200,9 @@ class CliAndReviewTests(unittest.TestCase):
         self.assertIn("rescue         boot into a non-destructive RAM rescue environment", r.stderr)
         self.assertIn("--console-only", r.stderr)
         self.assertIn("--clean", r.stderr)
-        self.assertIn("no OS image or write command is staged", r.stderr)
+        self.assertIn("stages no write command or autostart", r.stderr)
+        self.assertIn("--rescue-backend alpine-kexec", r.stderr)
+        self.assertIn("--rescue-console TTY", r.stderr)
         self.assertIn("install/rescue", r.stderr)
 
     def test_rescue_rejects_manifest_mirror_options_before_privilege_or_facts(self):

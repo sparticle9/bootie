@@ -344,5 +344,89 @@ class RescuePlanCliTests(unittest.TestCase):
                 self.assertTrue("ENVELOPE-FAIL" in err or "BLOCKER:" in err)
 
 
+class AlpineRescueTests(unittest.TestCase):
+    def facts(self):
+        return dict(parse_facts(), bootloader="unknown", disk_driver="virtio_blk",
+                    net_driver="virtio_net")
+
+    def test_btrfs_inspection_mount_is_read_only_with_log_replay_disabled(self):
+        script = ROOT / "engine/alpine-rescue-inspect.sh"
+        result = subprocess.run(
+            ["sh", "-c", r'''
+                test() { [ "$1" = -b ] && [ "$2" = /dev/vda2 ]; }
+                mount() { printf '%s\n' "$@"; }
+                helper=$1
+                set -- mount-ro btrfs /dev/vda2
+                . "$helper"
+            ''', "test-helper", str(script)],
+            capture_output=True, text=True, check=True,
+        )
+        self.assertEqual(result.stdout.splitlines(), [
+            "-t", "btrfs", "-o", "ro,rescue=nologreplay,nodev,nosuid,noexec",
+            "/dev/vda2", "/mnt",
+        ])
+
+    def test_explicit_backend_plans_offline_without_install_payload_or_grub(self):
+        facts = self.facts()
+        plan = rp.build_rescue_plan(facts, backend="alpine-kexec")
+        self.assertEqual(rp.fit_issues(plan), [])
+        self.assertFalse(any(probe["status"] == "fail" for probe in plan["envelope"]))
+        self.assertEqual(plan["approval"], rp.approval_token(plan))
+        self.assertTrue(plan["approval"].startswith("alpine-rescue:testhost:"))
+        self.assertTrue({"artifact", "manifest", "write"}.isdisjoint(plan))
+        self.assertEqual(rp.build_rescue_plan(facts)["approval"], "rescue:testhost")
+
+    def test_alpine_refuses_unsupported_shapes(self):
+        for change in ({"arch": "aarch64"}, {"virt": "container:lxc"},
+                       {"mem_mib": "1024"}, {"ipv4_addr": "192.0.2.10/32"},
+                       {"ipv4_gateway": "192.0.3.1"}, {"net_driver": "e1000"},
+                       {"disk_count": "2"}, {"disk_driver": "virtio_scsi"}):
+            with self.subTest(change=change):
+                plan = rp.build_rescue_plan(dict(self.facts(), **change), backend="alpine-kexec")
+                self.assertTrue(rp.fit_issues(plan))
+        for secure_boot in ("enabled", "unknown"):
+            plan = rp.build_rescue_plan(dict(self.facts(), firmware="uefi", secure_boot=secure_boot),
+                                        backend="alpine-kexec")
+            self.assertTrue(any(probe["name"] == "firmware" and probe["status"] == "fail"
+                                for probe in plan["envelope"]))
+        with self.assertRaisesRegex(ValueError, "no risk override"):
+            rp.build_rescue_plan(self.facts(), ["drivers"], backend="alpine-kexec")
+
+    def test_corrupt_iso_is_rejected_before_extraction(self):
+        import alpine_rescue as alpine
+        with tempfile.TemporaryDirectory() as tmp:
+            work = Path(tmp)
+            plan = rp.build_rescue_plan(self.facts(), backend="alpine-kexec")
+            (work / "plan.json").write_text(json.dumps(plan))
+            (work / "alpine.iso").write_bytes(b"bad")
+            with mock.patch.object(alpine, "run") as run:
+                with self.assertRaisesRegex(ValueError, "SHA-256"):
+                    alpine.assemble(work, "ttyS0", True)
+            self.assertEqual(run.call_count, 1)
+            self.assertFalse((work / "image").exists())
+
+    def test_load_failure_cannot_request_shutdown_and_shutdown_failure_unloads(self):
+        import alpine_rescue as alpine
+        for failed_command in ("kexec", "systemctl"):
+            with self.subTest(failed_command=failed_command), tempfile.TemporaryFile() as lock:
+                calls = []
+
+                def run(*args):
+                    calls.append(args)
+                    if args[0] == failed_command:
+                        raise subprocess.CalledProcessError(1, args)
+
+                with (mock.patch.object(alpine.os, "open", return_value=os.dup(lock.fileno())),
+                      mock.patch.object(alpine, "precheck"),
+                      mock.patch.object(alpine.signal, "signal"),
+                      mock.patch.object(alpine, "run", side_effect=run)):
+                    with self.assertRaises(subprocess.CalledProcessError):
+                        alpine.handoff(Path("/stage"), "ttyS0")
+                self.assertEqual(calls[0][:3], ("kexec", "-s", "-l"))
+                self.assertIn("rdinit=/init", calls[0][-1])
+                self.assertEqual(calls[1:], [] if failed_command == "kexec" else
+                                 [("systemctl", "kexec"), ("kexec", "-s", "-u")])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -92,9 +92,6 @@ and disposable-VM validation:
 
 - Broader validated storage/NIC driver coverage (e.g. NVMe and non-virtio NICs)
   beyond the current virtio baseline.
-- A compact `alpine-virt` RAM live/rescue backend (documented in
-  [docs/RESCUE_DESIGN.md](docs/RESCUE_DESIGN.md)) to decouple from Debian/apt
-  on the source host and provide richer disk-repair tooling.
 - Optional DHCP-backed liveenv networking where the read-only `dhcp_available`
   probe confirms it, unlocking DHCP-served `/32` VPS shapes safely.
 - Explicit, credential-safe post-boot hooks (e.g. opt-in Tailscale setup
@@ -157,7 +154,7 @@ Options:
                        releases (Debian/Ubuntu); resolved URLs are double-confirmed
 --console-only         rescue only: allow rescue without SSH keys when console access exists
 --clean                rescue only: remove staged rescue artifacts after returning
---no-reboot            install/rescue: stage everything but leave the reboot to you
+--no-reboot            stage without rebooting (Alpine assembles and discards)
 ```
 
 ### Keys, passwords, and SSH access
@@ -187,6 +184,24 @@ command or autostart script. It uses a separate staging directory
 Rebooting (or running `/bootie-rescue/rescue-helper.sh return`) returns to the
 prior OS unchanged, and `sh bootie.sh rescue --clean` removes all rescue
 staging files afterward.
+
+### Experimental Alpine rescue
+
+On a disposable x86_64 KVM/QEMU guest with systemd, virtio-blk, virtio-net,
+simple IPv4, and a tested provider console, opt in explicitly:
+
+```sh
+sh bootie.sh rescue --rescue-backend alpine-kexec --rescue-console ttyS0 --no-reboot
+```
+
+With `--no-reboot` the Alpine path checks the source and assembles a temporary
+image, then removes it without loading a kernel. Omit it for the interactive
+kexec handoff. Use `tty1` for an available virtual terminal, and add
+`--console-only` to disable SSH even when keys are present. Alpine rescue completed
+Debian 13 KVM roundtrips on BIOS and UEFI with Secure Boot off. It also
+completed an Omarchy 4.5.0-3 roundtrip on KVM with Limine/UEFI and
+`kexec-tools` installed on the source. See the [support matrix](docs/SUPPORT_MATRIX.md) and
+[Alpine recovery steps](docs/RESCUE_DESIGN.md#3-alpine-virt-and-kexec-feasibility).
 
 ## Repository layout
 

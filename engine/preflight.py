@@ -570,7 +570,7 @@ def build_plan(facts, manifest, artifact, liveenv_overrides=None, accepted_risks
     return plan
 
 
-def build_rescue_plan(facts, accepted_risks=None):
+def build_rescue_plan(facts, accepted_risks=None, backend="debian-initramfs"):
     """Build the offline, non-destructive rescue plan.
 
     Unlike install planning, rescue planning resolves no OS artifact and makes
@@ -593,14 +593,21 @@ def build_rescue_plan(facts, accepted_risks=None):
         "accepted_risks": accepted_risks,
         "fingerprint": fp,
     }
-    plan["ip_cmdline"] = ip_cmdline(facts)
+    if backend == "alpine-kexec":
+        if accepted_risks:
+            raise ValueError("Alpine rescue allows no risk override")
+        plan["liveenv"] = {"kind": backend, "mode": "rescue", "ssh_port": 22}
+    else:
+        plan["ip_cmdline"] = ip_cmdline(facts)
     plan["envelope"] = support_envelope(plan)
-    plan["approval"] = f"rescue:{facts['hostname']}"
+    plan["approval"] = approval_token(plan)
     return plan
 
 
 def approval_token(plan):
     if plan.get("mode") == "rescue":
+        if plan.get("liveenv", {}).get("kind") == "alpine-kexec":
+            return f"alpine-rescue:{plan['host']}:{plan['fingerprint']}"
         return f"rescue:{plan['host']}"
     m = plan["manifest"]
     return f"{plan['host']}:{m['name']}:{m['version']}:{plan['fingerprint']}"
@@ -653,7 +660,11 @@ def support_envelope(plan):
 
     # bootloader — the staging path uses GRUB's one-shot boot entry support.
     bootloader = f.get("bootloader") or "unknown"
-    if bootloader == "grub":
+    alpine = plan.get("liveenv", {}).get("kind") == "alpine-kexec"
+    if alpine:
+        probes.append({"name": "bootloader", "status": "warn",
+                       "note": "experimental kexec handoff; kernel admission checked before shutdown"})
+    elif bootloader == "grub":
         probes.append({"name": "bootloader", "status": "pass",
                        "note": "GRUB with grub-reboot — drill-proven staging path"})
     else:
@@ -668,7 +679,7 @@ def support_envelope(plan):
     firmware = f["firmware"]
     if firmware == "bios":
         probes.append({"name": "firmware", "status": "pass",
-                       "note": "BIOS — drill-proven path"})
+                       "note": "BIOS observed" if alpine else "BIOS — drill-proven path"})
     elif firmware == "uefi":
         sb = f.get("secure_boot", "unknown")
         if sb == "enabled":
@@ -682,7 +693,8 @@ def support_envelope(plan):
                                    "are readable before running bootie"})
         else:
             probes.append({"name": "firmware", "status": "pass",
-                           "note": "UEFI (Secure Boot disabled) — drill-proven path"})
+                           "note": "UEFI (Secure Boot disabled)" if alpine else
+                                   "UEFI (Secure Boot disabled) — drill-proven path"})
     else:
         probes.append({"name": "firmware", "status": "fail",
                        "note": f"firmware '{firmware}' is outside the current support envelope"})
@@ -771,6 +783,9 @@ def fit_issues(plan):
     issues = []
     f = plan["facts"]
     if plan.get("mode") == "rescue":
+        if plan.get("liveenv", {}).get("kind") == "alpine-kexec":
+            from alpine_rescue import fit_issues as alpine_fit_issues
+            return alpine_fit_issues(f)
         # Rescue carries no target OS image, so artifact/manifest size and arch
         # rules do not apply. The floor is a nominal 512 MiB VPS minus the RAM
         # Linux reserves before MemTotal is exposed.
@@ -828,6 +843,7 @@ def main(argv=None):
                    help="HTTPS mirror base URL for checksum-indexed release artifacts")
 
     p = sub.add_parser("rescue-plan", help="build non-destructive rescue plan JSON offline")
+    p.add_argument("--backend", choices=("debian-initramfs", "alpine-kexec"), default="debian-initramfs")
     p.add_argument("--facts", required=True, help="facts.sh output")
     p.add_argument("--host", help="require facts hostname to match")
     p.add_argument("--accept-risk", action="append", default=[],
@@ -875,7 +891,7 @@ def main(argv=None):
             if args.host and facts["hostname"] != args.host:
                 print(f"facts hostname {facts['hostname']} != {args.host}", file=sys.stderr)
                 return 1
-            plan = build_rescue_plan(facts, accepted_risks=accepted_risks)
+            plan = build_rescue_plan(facts, accepted_risks=accepted_risks, backend=args.backend)
         except (OSError, ValueError) as exc:
             print(f"preflight error: {exc}", file=sys.stderr)
             return 1

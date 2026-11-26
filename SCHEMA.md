@@ -9,6 +9,9 @@ This document explains the structure, semantics, and execution rules behind
 that schema. For concrete, ready-to-use YAML files, see [`manifests/`](manifests/)
 and [`examples/manifests/`](examples/manifests/).
 
+Alpine kexec rescue is CLI-selected and performs no manifest resolution.
+The install manifest's `liveenv.kind` continues to select `debian-initramfs`.
+
 ## Two-ring design
 
 Every version-2 manifest separates ordinary OS configuration from low-level

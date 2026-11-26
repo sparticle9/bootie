@@ -6,6 +6,9 @@ both **BIOS** and **UEFI** x86_64 machines. It is intended as a durable
 reference for maintaining boot compatibility as firmware, bootloaders, and
 upstream cloud images evolve.
 
+Experimental Alpine rescue uses a separate systemd kexec handoff with no
+bootloader or EFI entry changes. See [the Alpine rescue design](RESCUE_DESIGN.md#3-alpine-virt-and-kexec-feasibility).
+
 ## 1. Host-side staging (`GRUB` one-shot handoff)
 
 `bootie` boots into its RAM live or rescue environment using the source host's

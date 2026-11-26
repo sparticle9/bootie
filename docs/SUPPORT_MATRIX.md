@@ -26,7 +26,7 @@ All bundled manifests and example profiles declare `arch: x86_64`.
   unsupported and unvalidated.
 - **Enforcement:** bundled install manifests reject a host architecture that
   differs from their `arch` field. This is not a universal architecture gate:
-  rescue has no manifest-architecture fit check, and changing a custom
+  default rescue has no manifest-architecture fit check, and changing a custom
   manifest's `arch` does not implement or validate another architecture.
 - **Development and CI hosts:** building the bundle or passing offline tests
   on ARM64 proves tooling behavior, not ARM kernel/initramfs boot, disk writing,
@@ -43,9 +43,9 @@ All bundled manifests and example profiles declare `arch: x86_64`.
 | BIOS + GRUB | drill-proven | validated across Debian 13, Ubuntu 24.04/26.04, and `bootie rescue` |
 | UEFI + GRUB, Secure Boot disabled | drill-proven (OVMF) | validated across `bootie rescue`, Debian 13, Ubuntu 24.04, and Omarchy 4.5 (`BOOTX64.EFI` + best-effort `efibootmgr`) |
 | UEFI Secure Boot enabled or unconfirmed | refused | hard prerequisite: disable Secure Boot and ensure efivars are readable; never risk-overridable |
-| non-GRUB boot management | refused | direct kernel boot, Limine-managed source host, extlinux, unknown |
+| non-GRUB boot management | refused | default staging requires GRUB; see experimental Alpine rescue below |
 | apt-based Debian/Ubuntu source OS | drill-proven | current staging backend requirement (`initramfs-tools` + GRUB) |
-| non-apt source OS | refused | staging backend cannot install liveenv packages |
+| non-apt source OS | refused | default staging requires apt; see experimental Alpine rescue below |
 | one clear system disk | drill-proven | hardware fingerprint still required |
 | multiple simple disks | warn / review | operator must verify target disk and fingerprint before approval |
 | RAID, LVM, encrypted root, multiboot | refused | ambiguous destructive boundary |
@@ -66,6 +66,8 @@ All bundled manifests and example profiles declare `arch: x86_64`.
 | `ubuntu-24.04` | x86_64 | drill-proven (BIOS + UEFI Secure Boot off, virtio) | Official Ubuntu 24.04 LTS (`noble`) cloud qcow2 via `SHA256SUMS`; 100% unattended BIOS & OVMF UEFI drills passed (incl. separate `/boot`, ext4 grow, netplan, locale) |
 | `ubuntu-26.04` | x86_64 | drill-proven (BIOS + virtio) | Official Ubuntu 26.04 LTS (`resolute`) cloud qcow2 via `SHA256SUMS`; 100% unattended BIOS drill passed |
 | `bootie rescue` (`debian-initramfs`) | x86_64 | drill-proven (BIOS + UEFI Secure Boot off, virtio) | Non-destructive RAM rescue roundtrip (`info`, `mount-ro`, `umount`, `return`, `rescue --clean`) passed on BIOS and OVMF UEFI |
+| `bootie rescue --rescue-backend alpine-kexec` | x86_64 | drill-proven (Debian 13 KVM, BIOS and OVMF UEFI with Secure Boot off) | 2 GiB RAM, virtio-blk, virtio-net, simple DHCP-derived IPv4, key-only SSH on BIOS and UEFI, explicit serial console-only mode on BIOS. |
+| `alpine-kexec` from Omarchy 4.5.0-3 | x86_64 | drill-proven (KVM, Limine/OVMF UEFI with Secure Boot off) | Source requires `kexec-tools`; verified with 2 GiB RAM, virtio-blk/net, simple DHCP-derived IPv4, key-only SSH, read-only Btrfs inspection, and native return. VMware remains outside the current envelope. |
 | `examples/manifests/*` | x86_64 (declared, not drill-proven) | example profiles, not drill-proven | Opinionated templates (Ubuntu desktop, coding workspace, headless agent runtime) meant to be reviewed and customized |
 
 NixOS is a [planned target](ROADMAP.md#nixos-target-support), not an implemented

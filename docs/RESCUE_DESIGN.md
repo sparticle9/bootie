@@ -4,7 +4,7 @@ This document captures `bootie`'s design philosophy, security boundaries, and
 architectural tradeoffs for RAM live environments — covering both **lab /
 rehearsal testing** and **temporary or emergency recovery** on a running VPS.
 
-## 1. Design philosophy: structural separation over flags
+## 1. Default rescue: structural separation over flags
 
 A rescue shell must never be a "paused destructive install." Relying on a
 runtime flag to stop a destructive script from wiping a disk is fragile under
@@ -64,43 +64,81 @@ emergency recovery on a real VPS, keep these operational boundaries in mind:
   auth keys, private keys, or remote control-plane callbacks. Rescue relies on
   the host's existing IP and carried SSH public keys (or provider console).
 
-## 3. Live-environment backend tradeoffs (current & future)
+## 3. Alpine virt and kexec feasibility
 
-`bootie` deliberately keeps its live-environment surface narrow so every
-backend remains auditable.
+The opt-in `alpine-kexec` backend assembles a self-contained RAM image and
+hands it off through systemd kexec. The source bootloader remains in place.
+The Debian/Ubuntu initramfs and GRUB path remains the default.
 
-| dimension | `debian-initramfs` (implemented & validated) | `alpine-virt` RAM liveenv (future candidate) | `netboot.xyz` iPXE (console-only reference) |
-|---|---|---|---|
-| **Kernel / artifacts** | Host's own `/boot/vmlinuz-*` + custom `mkinitramfs` (0 MiB kernel download) | Alpine `virt` netboot (`vmlinuz-virt` + `initramfs-virt` + `modloop-virt`, ~43 MiB total vs. ~330 MiB for `lts`) | Tiny iPXE chainloader (~0.4–1.1 MiB) |
-| **Source-OS requirement** | Debian / Ubuntu (`apt-get` + `initramfs-tools` + GRUB) | Any Linux with GRUB + `grub-reboot` (no `initramfs-tools` needed) | Any Linux with GRUB + `grub-reboot` |
-| **Minimum RAM** | ~512 MiB (448 MiB effective floor) | ~512 MiB | Depends on chained OS |
-| **SSH access** | Dropbear (`root`, carried keys) | Dropbear or OpenSSH (`root`, carried keys via local dual-`initrd` cpio overlay) | **None** (VNC/serial console only) |
-| **Disk-repair tooling** | Busybox + staged `e2fsprogs`, `btrfs-progs`, `dosfstools`, `fdisk`, `gdisk`, `curl` | Full `apk` userspace (`xfsprogs`, `lvm2`, `cryptsetup`, `smartmontools`, `chroot`, etc.) | Operator-chosen network OS |
-| **UEFI Secure Boot** | Fails closed unless Secure Boot OFF | Unsigned kernel; requires Secure Boot OFF | Unsigned binary; requires Secure Boot OFF |
+### RAM image
 
-### Key technical notes for a future `alpine-virt` backend
+Bootie verifies the size and pinned SHA-256 of the official
+[Alpine 3.24.4 virt ISO](https://dl-cdn.alpinelinux.org/alpine/v3.24/releases/x86_64/)
+before extracting its kernel, initramfs and matching modloop. The ISO is
+about 67 MiB. The kernel, compressed initramfs and modloop total about
+43 MiB. Staging also needs space for extraction and the assembled initrd.
 
-If `bootie` later adds `alpine-virt` to support non-Debian/non-apt source hosts
-or richer RAM rescue tooling, three architectural details matter:
+A root-owned cpio overlay replaces Alpine's stock `/init`, which would
+otherwise discover boot media and assemble an OS from APK repositories.
+The overlay embeds modloop and, for SSH mode, the ISO's APK repository.
+The rescue init loads virtio drivers and mounts the module image from RAM
+before configuring networking. It checks mount and swap state before
+offering SSH. OpenSSH and its dependencies are installed into a temporary
+root from the embedded repository with package signature verification,
+network access and package scripts disabled. No boot services discover or
+mount source disks. An operator with root access can deliberately write
+to those disks.
 
-1. **Choose `virt`, not `lts`:** Alpine `lts` pulls ~330 MiB (mostly bare-metal
-   GPU/Wi-Fi firmware in `modloop-lts`), which breaks small `/boot` partitions
-   and 512 MiB VPSes. Alpine `virt` is ~43 MiB (~8× smaller) and carries the
-   virtualization drivers VPSes actually need.
-2. **Use a local dual-`initrd` cpio overlay (no remote HTTP `apkovl`):**
-   passing remote `apkovl=https://...` or `ssh_key=https://...` URLs violates
-   `bootie`'s zero-controller model. Instead, stage a tiny mode-0600 gzipped
-   `cpio` archive locally during host staging and load it as a second GRUB
-   `initrd` argument (`initrd /boot/bootie-alpine-initramfs-virt /boot/bootie-rescue-overlay.cpio.gz`).
-   The Linux kernel natively unpacks multiple `initrd` archives into the RAM
-   rootfs before `/init` runs.
-3. **Avoid the `modloop` NIC chicken-and-egg trap:** standard Alpine netboot
-   fetches `modloop-virt` over HTTPS during boot, which fails if the host's NIC
-   driver lives inside `modloop-virt`. Staging `modloop-virt` locally into the
-   overlay (or copying it to tmpfs before releasing the disk) removes the boot
-   network dependency while keeping the target disk completely unmounted.
-4. **DHCP vs. static IP reconstruction:** static `ip=<addr>::<gw>:<mask>:<host>:<if>:off`
-   works in both Debian `ipconfig` and Alpine `initramfs-init`. When the
-   read-only `engine/dhcp_probe.py` probe confirms `dhcp_available=yes`, future
-   adapters can safely opt into `ip=dhcp` to support DHCP-served `/32` or
-   off-subnet gateways cleanly.
+### Source prerequisites and handoff
+
+- Start with x86_64 KVM/QEMU, one simple virtio-blk disk, virtio-net with
+  the hardware MAC, simple IPv4 and a working provider serial or virtual
+  console. UEFI requires Secure Boot confirmed disabled. The backend refuses
+  driver overrides.
+- Use a systemd source with `python3`, `curl`, `bsdtar`, `kexec`, `ip`,
+  `findmnt`, and `blkid`. SSH mode also requires `ssh-keygen` to check
+  carried public keys. The experimental admission budget is 1536 MiB
+  MemTotal, 512 MiB MemAvailable, and 384 MiB free in the staging filesystem.
+  These are conservative thresholds pending measurements.
+- The plan is offline. After assembly and typed handoff confirmation, Bootie
+  rechecks source facts and requires an unarmed, enabled file-based kexec
+  facility. Kernel policy can still refuse the actual load. It then requests
+  orderly [`systemctl kexec`](https://www.freedesktop.org/software/systemd/man/latest/systemctl.html).
+  When shutdown submission fails, Bootie attempts to unload its own image
+  and reports an unload failure explicitly. Avoid concurrent kexec operations.
+- `--no-reboot` assembles and checks the temporary image without loading it
+  or retaining it for later use. `rescue --rescue-backend alpine-kexec --clean`
+  has no persistent staging to remove and does not change kernel state.
+
+### Access and recovery
+
+The selected provider console opens a root shell. Use a trusted provider
+console and verify access before handoff. For SSH, verify the ephemeral host
+key fingerprint printed on the console, then use key-only root login and a
+separate known-hosts file. `--console-only` keeps SSH disabled even if keys
+are found. If SSH startup fails, recover through the selected console.
+
+Run `/bootie-rescue/inspect info` on the console or `rescue-inspect info`
+over SSH to inspect mounts, swap and disks. Use `mount-ro ext4 /dev/vda2`
+with the helper and substitute the verified partition and filesystem.
+The helper supports ext4, btrfs and vfat. It disables ext4 journal replay
+with `noload` and btrfs tree-log replay with `rescue=nologreplay`. Use the helper's
+`umount` and `return` commands for a normal firmware reboot. If the handoff
+stalls, use the provider console reset path. Source boot configuration is
+untouched. If unload was reported to have failed while still in the source
+OS, verify kernel state through the console before attempting an ordinary
+reboot, since systemd can use an armed kexec image.
+
+### Validated configurations
+
+See the [support matrix](SUPPORT_MATRIX.md) for Debian 13 and Omarchy 4.5.0-3
+firmware and access coverage. The KVM drills verified kexec entry, serial
+access, inactive swap, unmounted source disks, read-only inspection, and a
+firmware reboot to the original OS. The SSH paths verified the ephemeral host
+key through the console and rejected login without a public key. Explicit
+console-only mode kept SSH and the rescue IPv4 address disabled even when a
+valid public key was supplied.
+
+The Omarchy source requires `kexec-tools`. The Limine/UEFI drill verified
+read-only Btrfs inspection through the shipped helper with tree-log replay
+disabled. VMware is outside the current admission envelope.

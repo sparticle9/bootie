@@ -96,7 +96,7 @@ The staging backend targets Linux apt-based source systems with GRUB and
 See [BOOT_AND_FIRMWARE.md](BOOT_AND_FIRMWARE.md) for the full technical design
 of BIOS/UEFI boot handling, Secure Boot probing, and ESP/NVRAM behavior.
 
-## Non-destructive rescue path
+## Default non-destructive rescue path
 
 `bootie rescue` is structurally separate from `install`:
 
@@ -115,8 +115,10 @@ of BIOS/UEFI boot handling, Secure Boot probing, and ESP/NVRAM behavior.
 - `sh bootie.sh rescue --clean` removes all rescue staging artifacts and
   unsets any armed rescue `next_entry` after returning to the prior OS.
 
-See [RESCUE_DESIGN.md](RESCUE_DESIGN.md) for the rescue architecture, lab and
-emergency security boundaries, and live-environment backend tradeoffs.
+The experimental Alpine backend uses the same offline planning and key
+collection, then assembles a separate RAM-only Alpine entry point and
+uses kexec through systemd. See [RESCUE_DESIGN.md](RESCUE_DESIGN.md) for
+the boot flow, recovery boundaries, and experimental admission rules.
 
 ## Keys, passwords, and SSH access
 

@@ -11,24 +11,15 @@ x86_64-only installation validation and target-specific firmware coverage.
 RAM rescue is also validated only on x86_64. ARM installation and rescue are
 unsupported; ARM64 build or unit-test results do not expand that boundary.
 
-The current source-host staging backend requires Debian/Ubuntu package tools,
+The install and default rescue staging backend requires Debian/Ubuntu package tools,
 initramfs-tools, and GRUB. Installing a target OS does not imply that bootie
 can subsequently stage another reinstall or rescue from that OS.
 
+The opt-in Alpine kexec backend provides RAM rescue from the Debian and
+Omarchy source configurations in the [support matrix](SUPPORT_MATRIX.md).
+See [RESCUE_DESIGN.md](RESCUE_DESIGN.md) for source prerequisites and recovery.
+
 ## Planned after initial publication
-
-### RAM live/rescue backend beyond Debian/Ubuntu
-
-- Evaluate an `alpine-virt` + `kexec` backend so rescue can be staged from
-  Omarchy and other non-apt/non-GRUB source hosts without assuming GRUB or
-  Limine integration. This is a design candidate, not implemented support.
-- Define fail-closed kernel, boot-handoff, driver, networking, and SSH-access
-  prerequisites; preserve structural separation from the disk-write engine.
-- Validate non-destructive entry, SSH access, and return to the prior OS on
-  disposable VMs before claiming any new source-host compatibility.
-
-See [RESCUE_DESIGN.md](RESCUE_DESIGN.md) for current rescue boundaries and
-live-environment tradeoffs.
 
 ### NixOS target support
 

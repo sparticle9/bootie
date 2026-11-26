@@ -32,7 +32,7 @@ usage: bootie [command] [options]
 commands:
   install        reinstall this machine (the default when no command is given)
   rescue         boot into a non-destructive RAM rescue environment
-                 (debian-initramfs; no OS image or write command is staged)
+                 (defaults to debian-initramfs)
   check          read-only probe: facts, plan fit and the support envelope —
                  nothing is installed, staged or mutated
   version        print the bootie version
@@ -42,7 +42,7 @@ options:
   --manifest NAME        bundled manifest to install (default omarchy-4.5)
   --manifest-file PATH   use a manifest file instead of a bundled one
   --key FILE             public keys to carry into the new OS and the liveenv
-                         dropbear rescue access (authorized_keys format,
+                         rescue SSH access (authorized_keys format,
                          several lines allowed)
   --password             install only: prompt interactively for the managed
                          user's password (hidden input; leave blank to
@@ -58,12 +58,15 @@ options:
                          checksum-indexed releases (Debian/Ubuntu); works with
                          check and install. exact resolved source URLs are
                          always printed for double confirmation
+  --rescue-backend alpine-kexec
+                         opt into experimental Alpine RAM rescue
+  --rescue-console TTY   Alpine rescue only: acknowledge access to ttyS0 or tty1
   --console-only         rescue only: acknowledge provider-console-only access
                          when no SSH keys are available
   --clean                rescue only: remove the rescue initramfs, GRUB entry,
                          initramfs hook, and staged rescue files
-  --no-reboot            install/rescue: stage everything but leave the reboot
-                         to you
+  --no-reboot            install/rescue: stage without rebooting
+                         Alpine assembles and discards its temporary image
 
 access after the reinstall — always printed for review before anything
 mutates:
@@ -77,8 +80,8 @@ liveenv rescue shell is unreachable over ssh — the review says so plainly,
 and with no authentication at all the run refuses to proceed.
 
 rescue mode is explicitly non-destructive: it resolves no manifest or OS
-artifact, stages no write command or autostart, arms only a one-shot GRUB
-entry, and rebooting returns to the prior OS unchanged. with no SSH keys it
+installation artifact, and stages no write command or autostart. The default
+uses one-shot GRUB. Alpine uses a one-time kexec handoff. With no SSH keys it
 refuses to proceed unless --console-only acknowledges provider console access.
 
 bootie runs as root or as a normal user with sudo. everything after the one
@@ -111,6 +114,8 @@ password_prompt=
 password_file=
 console_only=
 rescue_clean=
+rescue_backend=debian-initramfs
+rescue_console=
 while [ $# -gt 0 ]; do
     case "$1" in
         --key)
@@ -140,6 +145,14 @@ while [ $# -gt 0 ]; do
             [ -n "$2" ] || { echo "--mirror requires a non-empty URL" >&2; exit 2; }
             mirror=$2; shift 2 ;;
         --no-reboot) no_reboot=1; shift ;;
+        --rescue-backend)
+            [ "${2:-}" = alpine-kexec ] || { echo "expected --rescue-backend alpine-kexec" >&2; exit 2; }
+            rescue_backend=$2; shift 2 ;;
+        --rescue-console)
+            case "${2:-}" in
+                ttyS0|tty1) rescue_console=$2; shift 2 ;;
+                *) echo "expected --rescue-console ttyS0 or tty1" >&2; exit 2 ;;
+            esac ;;
         --console-only) console_only=1; shift ;;
         --clean) rescue_clean=1; shift ;;
         -h|--help) usage; exit 0 ;;
@@ -169,6 +182,19 @@ fi
 if [ "$cmd" != install ] && [ "$cmd" != rescue ] && [ -n "$no_reboot" ]; then
     echo "--no-reboot only applies to install and rescue" >&2
     usage
+    exit 2
+fi
+
+if [ "$rescue_backend" = alpine-kexec ]; then
+    [ "$cmd" = rescue ] || { echo "Alpine backend applies only to rescue" >&2; exit 2; }
+    [ -z "$accept_risks" ] || { echo "Alpine rescue allows no risk override" >&2; exit 2; }
+    if [ -n "$rescue_clean" ]; then
+        echo "Alpine rescue uses temporary staging; no persistent rescue files to remove"
+        exit 0
+    fi
+    [ -n "$rescue_console" ] || { echo "Alpine rescue requires a working --rescue-console" >&2; exit 2; }
+elif [ -n "$rescue_console" ]; then
+    echo "--rescue-console requires the Alpine backend" >&2
     exit 2
 fi
 
@@ -235,6 +261,12 @@ fi
 # --- dependencies ---------------------------------------------------------------
 # python3: facts/plan/staging. grub + initramfs-tools: the liveenv boot path.
 # curl/ca-certificates: artifact resolution. check mode only reports them.
+if [ "$rescue_backend" = alpine-kexec ]; then
+    for dep in python3 curl bsdtar kexec systemctl ip findmnt blkid; do
+        command -v "$dep" >/dev/null 2>&1 || { echo "missing Alpine rescue dependency: $dep" >&2; exit 1; }
+    done
+    [ "$(uname -s):$(uname -m)" = Linux:x86_64 ] || { echo "Alpine rescue requires x86_64 Linux" >&2; exit 1; }
+else
 missing=
 for dep in python3 curl mkinitramfs; do
     command -v "$dep" >/dev/null 2>&1 || missing="$missing $dep"
@@ -297,6 +329,8 @@ if [ -z "$grub_reboot" ] && [ -n "$needs_full_deps" ]; then
     echo "still missing: grub-reboot" >&2; exit 1
 fi
 
+fi
+
 # --- facts + plan ---------------------------------------------------------------
 work=$here/work
 trap 'rm -rf "$work"' EXIT
@@ -315,7 +349,7 @@ else
 fi
 if [ "$cmd" = rescue ]; then
     echo "==> resolving rescue plan (offline; no manifest or OS artifact)"
-    set -- --facts "$work/facts" --host "$host"
+    set -- --facts "$work/facts" --host "$host" --backend "$rescue_backend"
     if [ -n "$accept_risks" ]; then
         set -- "$@" --accept-risk "$accept_risks"
     fi
@@ -428,6 +462,12 @@ if [ "$cmd" = check ]; then
         fi
     fi
     echo "check complete: machine facts, plan fit and envelope probed — nothing was mutated"
+    exit 0
+fi
+
+if [ "$rescue_backend" = alpine-kexec ]; then
+    # shellcheck source=engine/alpine-rescue-stage.sh
+    . "$here/engine/alpine-rescue-stage.sh"
     exit 0
 fi
 

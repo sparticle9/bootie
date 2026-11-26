@@ -1,0 +1,246 @@
+#!/usr/bin/env bash
+# om-desktop — start, stop, and inspect an on-demand Omarchy desktop.
+#
+# Assumptions:
+# - Run as the desktop user, not root. sudo is used only for the display manager.
+# - The display manager is already configured for the desired Omarchy session
+#   (normally sddm autologin into UWSM/Hyprland); this script does not create
+#   users, sessions, or autologin configuration.
+# - hypr-rdp is optional. If its user unit exists, `up` waits for its listener
+#   and treats a missing listener as a failure; if the unit is absent, RDP is
+#   reported as not installed instead of failing the desktop start.
+# - `down` is runtime-only. It does not disable units or change boot targets.
+#   It stops the display manager, UWSM/Hyprland, desktop user services, UWSM
+#   app-*.scope units, and desktop activation sockets for the invoking user.
+
+set -u
+
+DM_SERVICE="${OM_DESKTOP_DM_SERVICE:-sddm.service}"
+COMPOSITOR_PROC="${OM_DESKTOP_COMPOSITOR_PROC:-Hyprland}"
+RDP_SERVICE="${OM_DESKTOP_RDP_SERVICE:-hypr-rdp.service}"
+RDP_PORT="${OM_DESKTOP_RDP_PORT:-3389}"
+DESKTOP_USER="$(id -un)"
+
+USER_SERVICES=(
+  "$RDP_SERVICE"
+  wayland-wm-app-daemon.service
+  omarchy-crash-watch.service
+  omarchy-fcitx5.service
+  omarchy-migrate-notify.service
+  omarchy-recover-internal-monitor.service
+  omarchy-sleep-lock.service
+  hyprsunset.service
+  owed.service
+  pipewire-pulse.service
+  pipewire.service
+  wireplumber.service
+  xdg-desktop-portal-hyprland.service
+  xdg-desktop-portal-gtk.service
+  xdg-desktop-portal.service
+  xdg-desktop-portal-rewrite-launchers.service
+  xdg-document-portal.service
+  xdg-permission-store.service
+  at-spi-dbus-bus.service
+  gvfs-daemon.service
+  gvfs-metadata.service
+  gvfs-mtp-volume-monitor.service
+  gvfs-udisks2-volume-monitor.service
+  dconf.service
+  gnome-keyring-daemon.service
+)
+
+USER_SOCKETS=(
+  pipewire-pulse.socket
+  pipewire.socket
+  gnome-keyring-daemon.socket
+)
+
+usage() {
+  cat <<USAGE
+usage: om-desktop {up|down|status}
+
+Start, stop, or inspect an on-demand Omarchy desktop session.
+
+Assumptions:
+  - Run as the desktop user, not root. sudo is used only for ${DM_SERVICE}.
+  - The display manager is already configured for the desired Omarchy session
+    (normally sddm autologin into UWSM/Hyprland). om-desktop does not create
+    users, sessions, autologin configuration, or boot policy.
+  - ${RDP_SERVICE} is optional. If it exists, up waits for tcp/${RDP_PORT};
+    if it is absent, RDP is skipped without failing the desktop start.
+  - down is runtime-only and acts on the invoking user's systemd session. It
+    stops UWSM app-*.scope units as part of the desktop; it does not disable
+    units or change the systemd boot target. Run down from SSH or a console:
+    a terminal inside the desktop is itself part of what is being stopped.
+
+Environment overrides:
+  OM_DESKTOP_DM_SERVICE       default: sddm.service
+  OM_DESKTOP_COMPOSITOR_PROC  default: Hyprland
+  OM_DESKTOP_RDP_SERVICE      default: hypr-rdp.service
+  OM_DESKTOP_RDP_PORT         default: 3389
+USAGE
+}
+
+require_context() {
+  if [ "$(id -u)" -eq 0 ]; then
+    echo 'error: run om-desktop as the desktop user, not root; it uses sudo only for the display manager' >&2
+    exit 2
+  fi
+  if ! command -v sudo >/dev/null 2>&1; then
+    echo 'error: sudo is required to start/stop the display manager' >&2
+    exit 2
+  fi
+  if ! systemctl --user list-units >/dev/null 2>&1; then
+    echo "error: systemd user manager is unavailable for ${DESKTOP_USER}; run from that user's login or ssh session" >&2
+    exit 2
+  fi
+}
+
+compositor_running() {
+  pgrep -u "$DESKTOP_USER" -x "$COMPOSITOR_PROC" >/dev/null 2>&1
+}
+
+compositor_stopped() {
+  ! compositor_running
+}
+
+rdp_unit_present() {
+  systemctl --user cat "$RDP_SERVICE" >/dev/null 2>&1
+}
+
+rdp_listening() {
+  command -v ss >/dev/null 2>&1 || return 1
+  ss -ltn 2>/dev/null | awk -v suffix=":${RDP_PORT}" '
+    substr($4, length($4) - length(suffix) + 1) == suffix { found=1 }
+    END { exit(found ? 0 : 1) }
+  '
+}
+
+wait_for() {
+  local steps="$1"
+  shift
+  local i
+  for ((i = 0; i < steps; i++)); do
+    if "$@"; then
+      return 0
+    fi
+    sleep 0.5
+  done
+  return 1
+}
+
+user_unit_state() {
+  if systemctl --user cat "$1" >/dev/null 2>&1; then
+    systemctl --user is-active "$1" 2>/dev/null || true
+  else
+    echo 'not-installed'
+  fi
+}
+
+desktop_status() {
+  printf 'default-target=%s\n' "$(systemctl get-default 2>/dev/null || true)"
+  printf 'display-manager=%s\n' "$DM_SERVICE"
+  printf 'display-manager-enabled=%s\n' "$(systemctl is-enabled "$DM_SERVICE" 2>/dev/null || true)"
+  printf 'display-manager-active=%s\n' "$(systemctl is-active "$DM_SERVICE" 2>/dev/null || true)"
+  printf 'rdp-service=%s\n' "$RDP_SERVICE"
+  printf 'rdp-service-active=%s\n' "$(user_unit_state "$RDP_SERVICE")"
+  printf 'compositor=%s\n' "$COMPOSITOR_PROC"
+  printf 'compositor-processes=%s\n' "$(pgrep -u "$DESKTOP_USER" -x "$COMPOSITOR_PROC" 2>/dev/null | wc -l | tr -d ' ')"
+  printf 'rdp-listener-count=%s\n' "$(ss -ltn 2>/dev/null | awk -v suffix=":${RDP_PORT}" 'substr($4, length($4) - length(suffix) + 1) == suffix {n++} END{print n+0}')"
+}
+
+desktop_up() {
+  systemctl --user start "${USER_SOCKETS[@]}" >/dev/null 2>&1 || true
+
+  if ! sudo systemctl start "$DM_SERVICE"; then
+    echo "error: unable to start ${DM_SERVICE}" >&2
+    return 1
+  fi
+
+  if ! wait_for 40 compositor_running; then
+    echo "error: ${COMPOSITOR_PROC} did not start for ${DESKTOP_USER}; check the display-manager/session configuration" >&2
+    return 1
+  fi
+
+  if rdp_unit_present; then
+    if wait_for 40 rdp_listening; then
+      echo "desktop up; ${RDP_SERVICE} listening on tcp/${RDP_PORT}"
+    else
+      echo "error: desktop is up but ${RDP_SERVICE} is not listening on tcp/${RDP_PORT}" >&2
+      return 1
+    fi
+  else
+    echo "desktop up; ${RDP_SERVICE} not installed"
+  fi
+}
+
+desktop_down() {
+  local rc=0
+  local sddm_state
+
+  systemctl --user stop "$RDP_SERVICE" >/dev/null 2>&1 || true
+
+  if ! sudo systemctl stop "$DM_SERVICE"; then
+    echo "warning: unable to stop ${DM_SERVICE}" >&2
+    rc=1
+  fi
+
+  if command -v uwsm >/dev/null 2>&1; then
+    uwsm stop >/dev/null 2>&1 || true
+  fi
+
+  wait_for 20 compositor_stopped || true
+
+  mapfile -t seat_sessions < <(loginctl list-sessions --no-legend 2>/dev/null | awk -v user="$DESKTOP_USER" '$3 == user && $4 != "-" {print $1}')
+  local session
+  for session in "${seat_sessions[@]}"; do
+    loginctl terminate-session "$session" >/dev/null 2>&1 || sudo loginctl terminate-session "$session" >/dev/null 2>&1 || true
+  done
+
+  mapfile -t session_units < <(systemctl --user list-units --all --no-legend --no-pager 2>/dev/null | awk '$1 ~ /^wayland-wm@/ || $1 ~ /^wayland-wm-env@/ || $1 ~ /^wayland-session-bindpid@/ {print $1}')
+  mapfile -t atspi_units < <(systemctl --user list-units --type=service --state=running --no-legend --no-pager 2>/dev/null | awk '$1 ~ /^dbus-.*org\.a11y\.atspi\.Registry/ {print $1}')
+  mapfile -t app_scopes < <(systemctl --user list-units --type=scope --state=running --no-legend --no-pager 2>/dev/null | awk '$1 ~ /^app-/ {print $1}')
+
+  local unit
+  for unit in "${USER_SERVICES[@]}" "${session_units[@]}" "${atspi_units[@]}" "${app_scopes[@]}"; do
+    systemctl --user stop "$unit" >/dev/null 2>&1 || true
+  done
+  for unit in "${USER_SOCKETS[@]}"; do
+    systemctl --user stop "$unit" >/dev/null 2>&1 || true
+  done
+
+  sleep 1
+  sddm_state=$(systemctl is-active "$DM_SERVICE" 2>/dev/null || true)
+  if [ "$sddm_state" != active ] && ! compositor_running && ! systemctl --user is-active --quiet "$RDP_SERVICE" 2>/dev/null && ! rdp_listening; then
+    if [ "$rc" -eq 0 ]; then
+      echo 'desktop down'
+    fi
+  else
+    echo 'error: desktop not fully down' >&2
+    desktop_status >&2
+    return 1
+  fi
+  return "$rc"
+}
+
+case "${1:-status}" in
+  up|start)
+    require_context
+    desktop_up
+    ;;
+  down|stop)
+    require_context
+    desktop_down
+    ;;
+  status)
+    require_context
+    desktop_status
+    ;;
+  help|-h|--help)
+    usage
+    ;;
+  *)
+    usage >&2
+    exit 2
+    ;;
+esac

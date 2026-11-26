@@ -1,0 +1,105 @@
+# Omarchy stable — official sealed VM image only.
+#
+# Resolved artifacts come from upstream's own index; nothing is mirrored,
+# repacked, or hosted by bootie. The target streams the qcow2 from upstream
+# directly to its disk at write time.
+#
+# This is the generic upstream-oriented profile. It deliberately does not
+# encode a private fleet user, application-removal list, Tailnet policy, or
+# owner-specific desktop preferences. See examples/manifests/ for opinionated
+# non-default profiles.
+manifest_version: 2
+name: omarchy
+version: "4.5.0"
+channel: stable               # the /stable/ path in index_url pins this channel
+arch: x86_64
+
+artifact:
+  kind: disk-image            # engine: qemu-img convert <https> /dev/<disk>
+  index_url: https://nightly.omarchy.org/stable/latest.json
+  requires:
+    arch: x86_64
+    virtual_size_max_gib: 48
+    min_size_gib: 40
+
+target:
+  disk_min_size_gib: 45
+  memory_min_mib: 2048
+  firmware: [bios, uefi]      # BIOS and UEFI (Secure Boot off) are drill-proven
+
+liveenv:
+  kind: debian-initramfs
+  packages:
+    - busybox-static
+    - dropbear-initramfs      # SSH-into-initramfs rescue path when keys exist
+    - openssh-client          # ssh-keygen for pre-generating target host keys
+    - curl
+    - qemu-utils              # qemu-img binary
+    - qemu-block-extra        # block-curl.so — the HTTPS driver (dlopen'd)
+    - btrfs-progs             # mount + scrub verification
+    - dosfstools              # ESP (FAT32) mount/check
+    - fdisk                   # sfdisk partition inspection/grow
+    - gdisk                   # sgdisk — move backup GPT to disk end
+  kernel_cmdline: "break=mount console=ttyS0,115200 console=tty0"
+  ssh_port: 22
+  mode: auto                  # target-resident write→personalize→verify→osboot
+
+write:
+  method: qemu-img-stream
+  scrub_after: true
+
+personalize:
+  rootfs: btrfs
+  root_subvol: "@"
+  esp_subvol: null            # ESP is its own FAT32 partition, not a subvol
+  network: networkmanager
+  ssh_host_keys: pregenerate
+  bios_boot: limine
+  connectivity_host: archlinux.org
+  remove_webapps: []          # no opinionated removals in the generic profile
+  drop_pkgs: []               # leaf-only when examples opt in; never force-remove
+  late_commands: []
+
+firstboot:
+  grow_partition: true
+  btrfs_resize: true
+
+cloud_config:
+  users:
+    - name: omarchy           # the image's sealed upstream user
+      sudo: "ALL=(ALL:ALL) ALL" # password-prompted sudo (desktop system)
+      lock_passwd: true       # unlocked at install time with per-install generated or --password password
+      ssh_authorized_keys: [] # discovered/--key keys are appended at stage time
+  runcmd:
+    # Refresh keyrings and run Omarchy's unattended system-package upgrade at
+    # first boot when the internet is reachable. On BIOS, copy Limine's
+    # regenerated kernel/initramfs into the bootie fallback paths. The finisher
+    # uses the marker to reboot once into the upgraded kernel.
+    - >-
+      if curl -sf --connect-timeout 10 --max-time 20 --retry 2 --retry-delay 2 -o /dev/null https://archlinux.org/; then
+        echo 'internet reachable; running first-boot Omarchy system upgrade';
+        export OMARCHY_UPDATE_UNATTENDED=1;
+        if ! omarchy-update-keyring || ! omarchy-update-system-pkgs; then
+          exit 1;
+        fi;
+        if [ ! -d /sys/firmware/efi ]; then
+          machine_id=$(cat /etc/machine-id);
+          kernel_bootdir="/boot/$machine_id/linux-omarchy";
+          if [ ! -f "$kernel_bootdir/vmlinuz" ] || [ ! -f "$kernel_bootdir/initramfs" ]; then
+            echo "limine-entry-tool kernel files missing under $kernel_bootdir" >&2;
+            exit 1;
+          fi;
+          cp "$kernel_bootdir/vmlinuz" /boot/vmlinuz || exit 1;
+          cp "$kernel_bootdir/initramfs" /boot/initrd || exit 1;
+        fi;
+        mkdir -p /var/lib/bootie && touch /var/lib/bootie/firstboot-system-upgrade-ok;
+      else
+        echo 'internet unreachable; skipping first-boot Omarchy system upgrade';
+      fi
+
+postinstall:
+  managed_user: omarchy
+  install_om_desktop: true
+  # Generic upstream behavior remains graphical-by-default. See
+  # examples/manifests/coding-workspace-omarchy.yml for a console-first profile.
+  boot_target: desktop

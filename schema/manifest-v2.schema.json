@@ -1,0 +1,380 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/sparticle9/bootie/main/schema/manifest-v2.schema.json",
+  "title": "bootie manifest (version 2)",
+  "description": "Declarative installation contract for bootie: extension-ring hardware/artifact/adapter rules plus a cloud-config-inspired standard ring.",
+  "type": "object",
+  "required": [
+    "manifest_version",
+    "name",
+    "version",
+    "arch",
+    "artifact",
+    "target",
+    "liveenv",
+    "write"
+  ],
+  "properties": {
+    "manifest_version": {
+      "const": 2,
+      "description": "Schema version; must be 2 for current manifests."
+    },
+    "name": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Short distribution family identifier (e.g. debian, ubuntu, omarchy)."
+    },
+    "version": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Release version string (e.g. '13', '24.04', '4.5.0')."
+    },
+    "channel": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Optional release channel guard; when set on JSON-index manifests, must appear as a path segment in artifact.index_url."
+    },
+    "arch": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Target CPU architecture (e.g. x86_64)."
+    },
+    "artifact": {
+      "$ref": "#/$defs/artifact"
+    },
+    "target": {
+      "$ref": "#/$defs/target"
+    },
+    "liveenv": {
+      "$ref": "#/$defs/liveenv"
+    },
+    "write": {
+      "$ref": "#/$defs/write"
+    },
+    "personalize": {
+      "$ref": "#/$defs/personalize"
+    },
+    "firstboot": {
+      "$ref": "#/$defs/firstboot"
+    },
+    "postinstall": {
+      "$ref": "#/$defs/postinstall"
+    },
+    "cloud_config": {
+      "$ref": "#/$defs/cloud_config"
+    }
+  },
+  "patternProperties": {
+    "^x-": {
+      "description": "Forward-compatible extension metadata ignored by preflight."
+    }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "artifact_requires": {
+      "type": "object",
+      "properties": {
+        "arch": {
+          "type": "string",
+          "minLength": 1
+        },
+        "min_size_gib": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "virtual_size_max_gib": {
+          "type": "integer",
+          "minimum": 1
+        }
+      },
+      "patternProperties": {
+        "^x-": {}
+      },
+      "additionalProperties": false
+    },
+    "artifact": {
+      "description": "Upstream artifact source. bootie never hosts or mirrors OS images.",
+      "oneOf": [
+        {
+          "title": "Upstream JSON-indexed disk image",
+          "type": "object",
+          "required": ["kind", "index_url"],
+          "properties": {
+            "kind": { "const": "disk-image" },
+            "index_url": {
+              "type": "string",
+              "pattern": "^https://[^\\s]+$"
+            },
+            "requires": { "$ref": "#/$defs/artifact_requires" }
+          },
+          "patternProperties": { "^x-": {} },
+          "additionalProperties": false
+        },
+        {
+          "title": "Upstream checksum-indexed disk image",
+          "type": "object",
+          "required": ["kind", "checksums_url", "image_file"],
+          "properties": {
+            "kind": { "const": "disk-image" },
+            "checksums_url": {
+              "type": "string",
+              "pattern": "^https://[^\\s]+$"
+            },
+            "image_file": {
+              "type": "string",
+              "pattern": "^[^/\\s]+$",
+              "not": { "enum": [".", ".."] }
+            },
+            "checksum_alg": {
+              "type": "string",
+              "enum": ["sha256", "sha512"]
+            },
+            "requires": { "$ref": "#/$defs/artifact_requires" }
+          },
+          "patternProperties": { "^x-": {} },
+          "additionalProperties": false
+        },
+        {
+          "title": "Legacy netboot-installer (fail-closed seam)",
+          "type": "object",
+          "required": ["kind", "base_url", "files", "checksums"],
+          "properties": {
+            "kind": { "const": "netboot-installer" },
+            "base_url": {
+              "type": "string",
+              "pattern": "^https?://[^\\s]+$"
+            },
+            "files": {
+              "type": "object",
+              "required": ["kernel", "initrd"],
+              "properties": {
+                "kernel": { "type": "string", "minLength": 1 },
+                "initrd": { "type": "string", "minLength": 1 }
+              },
+              "additionalProperties": false
+            },
+            "checksums": { "type": "string", "minLength": 1 },
+            "requires": { "$ref": "#/$defs/artifact_requires" }
+          },
+          "patternProperties": { "^x-": {} },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "target": {
+      "type": "object",
+      "required": ["disk_min_size_gib", "memory_min_mib", "firmware"],
+      "properties": {
+        "disk_min_size_gib": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "memory_min_mib": {
+          "type": "integer",
+          "minimum": 128
+        },
+        "firmware": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "enum": ["bios", "uefi"]
+          }
+        }
+      },
+      "patternProperties": { "^x-": {} },
+      "additionalProperties": false
+    },
+    "liveenv": {
+      "type": "object",
+      "required": ["kind"],
+      "properties": {
+        "kind": {
+          "type": "string",
+          "enum": ["debian-initramfs"]
+        },
+        "packages": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "kernel_cmdline": { "type": "string" },
+        "ssh_port": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 65535
+        },
+        "mode": {
+          "type": "string",
+          "enum": ["hold", "auto"]
+        },
+        "hold": {
+          "type": "boolean",
+          "description": "Legacy alias for mode (true -> hold, false -> auto)."
+        }
+      },
+      "patternProperties": { "^x-": {} },
+      "additionalProperties": false
+    },
+    "write": {
+      "type": "object",
+      "required": ["method"],
+      "properties": {
+        "method": {
+          "type": "string",
+          "enum": ["qemu-img-stream", "netboot-preseed"]
+        },
+        "scrub_after": { "type": "boolean" }
+      },
+      "patternProperties": { "^x-": {} },
+      "additionalProperties": false
+    },
+    "personalize": {
+      "type": "object",
+      "properties": {
+        "rootfs": {
+          "type": "string",
+          "enum": ["btrfs", "ext4"]
+        },
+        "root_subvol": { "type": "string" },
+        "esp_subvol": {
+          "type": ["string", "null"]
+        },
+        "network": {
+          "type": "string",
+          "enum": ["networkmanager", "systemd-networkd", "netplan", "none"]
+        },
+        "ssh_host_keys": { "type": "string" },
+        "bios_boot": {
+          "type": ["string", "null"],
+          "enum": ["limine", "image-native", "none", null]
+        },
+        "connectivity_host": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9.-]+$"
+        },
+        "remove_webapps": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": "^[^/]+$",
+            "not": { "enum": [".", ".."] }
+          }
+        },
+        "drop_pkgs": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "late_commands": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 }
+        }
+      },
+      "patternProperties": { "^x-": {} },
+      "additionalProperties": false
+    },
+    "firstboot": {
+      "type": "object",
+      "properties": {
+        "grow_partition": { "type": "boolean" },
+        "btrfs_resize": { "type": "boolean" }
+      },
+      "patternProperties": { "^x-": {} },
+      "additionalProperties": false
+    },
+    "postinstall": {
+      "type": "object",
+      "properties": {
+        "managed_user": { "type": "string", "minLength": 1 },
+        "boot_target": {
+          "type": "string",
+          "enum": ["console", "desktop"]
+        },
+        "install_om_desktop": { "type": "boolean" }
+      },
+      "patternProperties": { "^x-": {} },
+      "additionalProperties": false
+    },
+    "cloud_config_user": {
+      "type": "object",
+      "required": ["name"],
+      "properties": {
+        "name": { "type": "string", "minLength": 1 },
+        "groups": {
+          "oneOf": [
+            { "type": "string" },
+            { "type": "array", "items": { "type": "string", "minLength": 1 } }
+          ]
+        },
+        "shell": { "type": "string" },
+        "sudo": { "type": "string" },
+        "lock_passwd": { "type": "boolean" },
+        "passwd": { "type": "string" },
+        "ssh_authorized_keys": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 }
+        }
+      },
+      "patternProperties": { "^x-": {} },
+      "additionalProperties": false
+    },
+    "cloud_config_file": {
+      "type": "object",
+      "required": ["path"],
+      "properties": {
+        "path": { "type": "string", "minLength": 1 },
+        "content": { "type": "string" },
+        "owner": { "type": "string" },
+        "permissions": { "type": "string" },
+        "encoding": {
+          "type": "string",
+          "enum": ["plain", "b64", "base64"]
+        },
+        "append": { "const": false }
+      },
+      "patternProperties": { "^x-": {} },
+      "additionalProperties": false
+    },
+    "cloud_config": {
+      "type": "object",
+      "properties": {
+        "users": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/cloud_config_user" }
+        },
+        "write_files": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/cloud_config_file" }
+        },
+        "runcmd": {
+          "type": "array",
+          "items": {
+            "oneOf": [
+              { "type": "string", "minLength": 1 },
+              {
+                "type": "array",
+                "items": { "type": "string" }
+              }
+            ]
+          }
+        },
+        "packages": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "package_update": { "type": "boolean" },
+        "hostname": { "type": "string", "minLength": 1 },
+        "fqdn": { "type": "string", "minLength": 1 },
+        "locale": {
+          "type": ["string", "null"],
+          "pattern": "^[A-Za-z0-9_.@-]+$"
+        },
+        "timezone": {
+          "type": ["string", "null"],
+          "pattern": "^[A-Za-z0-9_+-]+(/[A-Za-z0-9_+-]+)*$"
+        }
+      },
+      "patternProperties": { "^x-": {} },
+      "additionalProperties": false
+    }
+  }
+}

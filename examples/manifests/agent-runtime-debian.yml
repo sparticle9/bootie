@@ -1,0 +1,82 @@
+# Opinionated example: small headless Debian 13 agent runtime.
+#
+# This example uses the official Debian trixie generic cloud qcow2 image and
+# adds only the small package/user surface needed by an unattended coding or
+# automation agent. Review the passwordless-sudo grant before use and remove it
+# if the agent does not need root.
+#
+# Example profile — not yet end-to-end drill-validated.
+manifest_version: 2
+name: debian
+version: "13"
+arch: x86_64
+x-codename: trixie
+x-status: implemented-not-drill-proven
+x-example: small-agent-runtime
+
+artifact:
+  kind: disk-image
+  checksums_url: https://cloud.debian.org/images/cloud/trixie/latest/SHA512SUMS
+  image_file: debian-13-generic-amd64.qcow2
+  checksum_alg: sha512
+  requires:
+    arch: x86_64
+    min_size_gib: 8
+
+target:
+  disk_min_size_gib: 20
+  memory_min_mib: 1024
+  firmware: [bios, uefi]
+
+liveenv:
+  kind: debian-initramfs
+  packages:
+    - busybox-static
+    - dropbear-initramfs
+    - openssh-client
+    - curl
+    - qemu-utils
+    - qemu-block-extra
+    - e2fsprogs
+    - dosfstools
+    - fdisk
+    - gdisk
+  kernel_cmdline: "break=mount console=ttyS0,115200 console=tty0"
+  ssh_port: 22
+  mode: auto
+
+write:
+  method: qemu-img-stream
+  scrub_after: false
+
+personalize:
+  rootfs: ext4
+  network: systemd-networkd
+  ssh_host_keys: pregenerate
+  bios_boot: image-native
+  connectivity_host: deb.debian.org
+  late_commands: []
+
+firstboot:
+  grow_partition: true
+  btrfs_resize: false
+
+cloud_config:
+  users:
+    - name: agent
+      groups: [sudo]
+      shell: /bin/bash
+      # Example-only convenience for an unattended agent runtime. Review this
+      # privilege; remove it if the agent does not need root.
+      sudo: "ALL=(ALL) NOPASSWD: ALL"
+      lock_passwd: true
+      ssh_authorized_keys: []
+  packages:
+    - git
+    - tmux
+  package_update: true
+
+postinstall:
+  managed_user: agent
+  boot_target: console
+  install_om_desktop: false

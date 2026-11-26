@@ -1,0 +1,13 @@
+# Generated release artifact — build locally or attach to releases; never commit.
+/bootie.sh
+
+# Local run state and Python environments.
+/work/
+/.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+
+# OS/editor noise.
+.DS_Store

@@ -1,0 +1,872 @@
+#!/bin/sh
+# bootie-main — target-resident reinstall entrypoint (debi.sh ergonomics).
+# Runs ON the machine being reinstalled: no controller, no ansible, no
+# inventory. Staging, approval and the boot into the live env happen here;
+# everything after the reboot is target-resident by design (initramfs
+# autostart -> write -> personalize -> in-env verify -> osboot -> firstboot
+# -> post-upgrade reboot).
+#
+# Privilege model: root, or any user with sudo (passwordless preferred for a
+# smooth run; sudo caches one password prompt otherwise). Nothing else needs
+# to exist beyond a basic Linux with sshd — missing pieces are reported and,
+# on apt-based systems, installed after confirmation.
+#
+# This script is normally executed from the self-extracting bootie bundle;
+# it expects its engine directory next to $0.
+set -eu
+
+# system administration tools (grub-reboot, mkinitramfs) live in sbin, which
+# a normal user's PATH on Debian excludes — probe with a complete PATH.
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin${PATH:+:$PATH}
+export PATH
+
+here=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+bootie_version=$(cat "$here/VERSION" 2>/dev/null || echo dev)
+
+. "$here/engine/prompt.sh"
+
+usage() {
+    cat >&2 <<'EOF'
+usage: bootie [command] [options]
+
+commands:
+  install        reinstall this machine (the default when no command is given)
+  rescue         boot into a non-destructive RAM rescue environment
+                 (debian-initramfs; no OS image or write command is staged)
+  check          read-only probe: facts, plan fit and the support envelope —
+                 nothing is installed, staged or mutated
+  version        print the bootie version
+  help           this text
+
+options:
+  --manifest NAME        bundled manifest to install (default omarchy-4.5)
+  --manifest-file PATH   use a manifest file instead of a bundled one
+  --key FILE             public keys to carry into the new OS and the liveenv
+                         dropbear rescue access (authorized_keys format,
+                         several lines allowed)
+  --password             install only: prompt interactively for the managed
+                         user's password (hidden input; leave blank to
+                         auto-generate a 10-char alphanumeric password)
+  --password-file PATH   install only: read the managed user's password from
+                         PATH (first line; avoids exposing passwords in argv)
+  --accept-risk CLASS    explicitly accept a fail-closed risk class; repeatable
+                         and comma-separated classes are accepted. currently
+                         supported: drivers — unverified mixed/non-virtio
+                         storage/NIC drivers, only when provider console
+                         recovery is available
+  --mirror URL           override the HTTPS release directory URL for
+                         checksum-indexed releases (Debian/Ubuntu); works with
+                         check and install. exact resolved source URLs are
+                         always printed for double confirmation
+  --console-only         rescue only: acknowledge provider-console-only access
+                         when no SSH keys are available
+  --clean                rescue only: remove the rescue initramfs, GRUB entry,
+                         initramfs hook, and staged rescue files
+  --no-reboot            install/rescue: stage everything but leave the reboot
+                         to you
+
+access after the reinstall — always printed for review before anything
+mutates:
+  with --key     the given keys are carried forward
+  without --key  the keys already authorized on this machine (invoking user
+                 and root) are carried forward — usually exactly the access
+                 you already use
+manifest users may additionally declare their own keys or a password hash.
+when no key material exists at all, access is password/console only and the
+liveenv rescue shell is unreachable over ssh — the review says so plainly,
+and with no authentication at all the run refuses to proceed.
+
+rescue mode is explicitly non-destructive: it resolves no manifest or OS
+artifact, stages no write command or autostart, arms only a one-shot GRUB
+entry, and rebooting returns to the prior OS unchanged. with no SSH keys it
+refuses to proceed unless --console-only acknowledges provider console access.
+
+bootie runs as root or as a normal user with sudo. everything after the one
+typed approval is unattended: reboot into the RAM live env, write,
+personalize, osboot, first-boot system upgrade, final reboot.
+EOF
+}
+
+# --- command dispatch ---------------------------------------------------------
+cmd=install
+case "${1:-}" in
+    install) shift ;;
+    rescue) cmd=rescue; shift ;;
+    check) cmd=check; shift ;;
+    version) echo "bootie $bootie_version"; exit 0 ;;
+    help|-h|--help) usage; exit 0 ;;
+    "") ;;
+    -*) ;;  # bare options mean install — debi.sh ergonomics
+    *) echo "unknown command: $1" >&2; usage; exit 2 ;;
+esac
+
+key=
+manifest=omarchy-4.5
+manifest_set=
+manifest_file=
+no_reboot=
+accept_risks=
+mirror=
+password_prompt=
+password_file=
+console_only=
+rescue_clean=
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --key)
+            [ $# -ge 2 ] || { echo "--key requires a FILE argument" >&2; usage; exit 2; }
+            key=$2; shift 2 ;;
+        --password)
+            password_prompt=1; shift ;;
+        --password-file)
+            [ $# -ge 2 ] || { echo "--password-file requires a PATH argument" >&2; usage; exit 2; }
+            [ -n "$2" ] || { echo "--password-file requires a non-empty PATH" >&2; usage; exit 2; }
+            password_file=$2; shift 2 ;;
+        --manifest)
+            [ $# -ge 2 ] || { echo "--manifest requires a NAME argument" >&2; usage; exit 2; }
+            manifest=$2; manifest_set=1; shift 2 ;;
+        --manifest-file)
+            [ $# -ge 2 ] || { echo "--manifest-file requires a PATH argument" >&2; usage; exit 2; }
+            manifest_file=$2; shift 2 ;;
+        --accept-risk)
+            [ $# -ge 2 ] || { echo "--accept-risk requires a CLASS argument" >&2; usage; exit 2; }
+            case "$2" in
+                ''|,*|*,|*,,*|*[!A-Za-z0-9_,-]*)
+                    echo "invalid --accept-risk CLASS: $2" >&2; exit 2 ;;
+            esac
+            accept_risks="${accept_risks:+$accept_risks,}$2"; shift 2 ;;
+        --mirror)
+            [ $# -ge 2 ] || { echo "--mirror requires a URL argument" >&2; usage; exit 2; }
+            [ -n "$2" ] || { echo "--mirror requires a non-empty URL" >&2; exit 2; }
+            mirror=$2; shift 2 ;;
+        --no-reboot) no_reboot=1; shift ;;
+        --console-only) console_only=1; shift ;;
+        --clean) rescue_clean=1; shift ;;
+        -h|--help) usage; exit 0 ;;
+        *) echo "unknown option: $1" >&2; usage; exit 2 ;;
+    esac
+done
+[ -z "$key" ] || [ -f "$key" ] || { echo "key file not found: $key" >&2; exit 2; }
+if [ -n "$password_prompt" ] && [ -n "$password_file" ]; then
+    echo "--password and --password-file cannot be used together" >&2
+    usage
+    exit 2
+fi
+if [ "$cmd" != install ]; then
+    [ -z "$password_prompt" ] || { echo "--password only applies to install" >&2; usage; exit 2; }
+    [ -z "$password_file" ] || { echo "--password-file only applies to install" >&2; usage; exit 2; }
+fi
+[ -z "$password_file" ] || [ -f "$password_file" ] || { echo "password file not found: $password_file" >&2; exit 2; }
+if [ "$cmd" != rescue ]; then
+    [ -z "$console_only" ] || { echo "--console-only only applies to rescue" >&2; usage; exit 2; }
+    [ -z "$rescue_clean" ] || { echo "--clean only applies to rescue" >&2; usage; exit 2; }
+fi
+if [ "$cmd" = rescue ]; then
+    [ -z "$manifest_set" ] || { echo "--manifest does not apply to rescue" >&2; usage; exit 2; }
+    [ -z "$manifest_file" ] || { echo "--manifest-file does not apply to rescue" >&2; usage; exit 2; }
+    [ -z "$mirror" ] || { echo "--mirror does not apply to rescue" >&2; usage; exit 2; }
+fi
+if [ "$cmd" != install ] && [ "$cmd" != rescue ] && [ -n "$no_reboot" ]; then
+    echo "--no-reboot only applies to install and rescue" >&2
+    usage
+    exit 2
+fi
+
+# interactive answers come from the controlling terminal whenever one
+# exists — in `curl ... | sh` mode stdin IS the script itself, so stdin is
+# only a valid answer source when there is no terminal (automation feeding
+# answers through a pipe). sets REPLY; nonzero when no answer is possible.
+prompt_read() {
+    bootie_prompt_read
+}
+
+confirm() {
+    printf '%s [y/N] ' "$1" >&2
+    prompt_read "" || return 1
+    reply=$REPLY
+    [ "$reply" = y ] || [ "$reply" = Y ] || [ "$reply" = yes ]
+}
+
+# --- privilege model ----------------------------------------------------------
+if [ "$(id -u)" = 0 ]; then
+    SUDO=
+    privmodel=root
+elif command -v sudo >/dev/null 2>&1; then
+    SUDO=sudo
+    privmodel="normal user with sudo"
+    if [ "$cmd" = install ] || [ "$cmd" = rescue ]; then
+        # sudo -n true succeeds cleanly for NOPASSWD users even when they also
+        # belong to a password-requiring group like %sudo (where `sudo -v`
+        # still demands a password). Fall back to `sudo -v` only when needed.
+        sudo -n true 2>/dev/null || sudo -v
+    fi
+else
+    echo "need root or a user with sudo — cannot run bootie" >&2
+    exit 1
+fi
+echo "bootie $bootie_version — privilege model: $privmodel"
+
+# rescue cleanup is intentionally independent of dependencies and facts: it
+# must remain available even on a half-broken host after the operator returns.
+if [ "$cmd" = rescue ] && [ -n "$rescue_clean" ]; then
+    echo "==> cleaning rescue staging"
+    $SUDO rm -f /boot/initrd-bootie-rescue.img \
+        /etc/grub.d/41_bootie_rescue \
+        /etc/initramfs-tools/hooks/bootie-rescue
+    $SUDO rm -rf /usr/local/share/bootie-rescue
+    grub_editenv=$(command -v grub-editenv || true)
+    if [ -n "$grub_editenv" ] && [ -f /boot/grub/grubenv ]; then
+        if $SUDO "$grub_editenv" /boot/grub/grubenv list 2>/dev/null | grep -qx 'next_entry=BOOTIE rescue (one-shot)'; then
+            $SUDO "$grub_editenv" /boot/grub/grubenv unset next_entry || {
+                echo "failed to clear the armed rescue next_entry" >&2; exit 1; }
+        fi
+    fi
+    if command -v update-grub >/dev/null 2>&1; then
+        $SUDO update-grub >/dev/null 2>&1 || {
+            echo "grub config regeneration failed" >&2; exit 1; }
+    elif command -v grub2-mkconfig >/dev/null 2>&1; then
+        $SUDO grub2-mkconfig -o /boot/grub/grub.cfg >/dev/null 2>&1 || {
+            echo "grub config regeneration failed" >&2; exit 1; }
+    fi
+    echo "rescue cleanup complete: removed rescue initramfs, GRUB entry, hook, and staged files"
+    exit 0
+fi
+
+# --- dependencies ---------------------------------------------------------------
+# python3: facts/plan/staging. grub + initramfs-tools: the liveenv boot path.
+# curl/ca-certificates: artifact resolution. check mode only reports them.
+missing=
+for dep in python3 curl mkinitramfs; do
+    command -v "$dep" >/dev/null 2>&1 || missing="$missing $dep"
+done
+if ! command -v grub-reboot >/dev/null 2>&1 && ! command -v grub2-reboot >/dev/null 2>&1; then
+    missing="$missing grub-reboot"
+fi
+if [ -n "$missing" ]; then
+    echo "missing target dependencies:$missing"
+    if [ "$cmd" = check ]; then
+        echo "(check mode: not installing anything — install would offer to apt-get these)"
+    elif command -v apt-get >/dev/null 2>&1; then
+        pkgs=
+        for c in $missing; do
+            case "$c" in
+                python3) pkgs="$pkgs python3" ;;
+                curl) pkgs="$pkgs curl ca-certificates" ;;
+                mkinitramfs) pkgs="$pkgs initramfs-tools" ;;
+                grub-reboot)
+                    if [ -d /sys/firmware/efi ]; then pkgs="$pkgs grub-efi"; else pkgs="$pkgs grub-pc"; fi ;;
+            esac
+        done
+        echo "suggested install: sudo apt-get install -y$pkgs"
+        if confirm "install the missing dependencies with apt-get now?"; then
+            if ! $SUDO env DEBIAN_FRONTEND=noninteractive apt-get update -qq; then
+                echo "dependency install failed" >&2; exit 1
+            fi
+            # Intentional word splitting: package names are a space-separated apt list.
+            # shellcheck disable=SC2086
+            $SUDO env DEBIAN_FRONTEND=noninteractive apt-get install -y $pkgs || {
+                echo "dependency install failed" >&2; exit 1; }
+        else
+            echo "cannot continue without dependencies" >&2; exit 1
+        fi
+    else
+        echo "not an apt-based system; install the equivalents and re-run" >&2
+        exit 1
+    fi
+fi
+# install and rescue modes re-verify everything the run needs — a half-failed
+# dependency install must surface here, not as a confusing error deep into
+# staging. check mode is read-only: it reports missing staging dependencies
+# but can still collect facts and produce a support verdict.
+if [ "$cmd" = install ]; then
+    needs_full_deps=1
+elif [ "$cmd" = rescue ]; then
+    needs_full_deps=1
+else
+    needs_full_deps=
+fi
+if [ -n "$needs_full_deps" ]; then
+    for dep in python3 curl mkinitramfs; do
+        command -v "$dep" >/dev/null 2>&1 || { echo "still missing: $dep" >&2; exit 1; }
+    done
+else
+    command -v python3 >/dev/null 2>&1 || { echo "still missing: python3" >&2; exit 1; }
+fi
+grub_reboot=$(command -v grub-reboot || command -v grub2-reboot || true)
+if [ -z "$grub_reboot" ] && [ -n "$needs_full_deps" ]; then
+    echo "still missing: grub-reboot" >&2; exit 1
+fi
+
+# --- facts + plan ---------------------------------------------------------------
+work=$here/work
+trap 'rm -rf "$work"' EXIT
+mkdir -p "$work"
+
+echo "==> collecting machine facts"
+$SUDO "$here/engine/facts.sh" > "$work/facts" || { echo "facts collection failed" >&2; exit 1; }
+
+host=$(sed -n 's/^hostname=//p' "$work/facts" | head -1)
+firmware=$(sed -n 's/^firmware=//p' "$work/facts" | head -1)
+boot_separate=$(sed -n 's/^boot_separate=//p' "$work/facts" | head -1)
+if [ "$boot_separate" = yes ]; then
+    grub_boot_prefix=
+else
+    grub_boot_prefix=/boot
+fi
+if [ "$cmd" = rescue ]; then
+    echo "==> resolving rescue plan (offline; no manifest or OS artifact)"
+    set -- --facts "$work/facts" --host "$host"
+    if [ -n "$accept_risks" ]; then
+        set -- "$@" --accept-risk "$accept_risks"
+    fi
+    python3 "$here/engine/preflight.py" rescue-plan "$@" > "$work/plan.json" || {
+        echo "rescue plan resolution failed" >&2; exit 1; }
+else
+    if [ -n "$manifest_file" ]; then
+        mfile=$manifest_file
+    elif [ -f "$here/manifests/$manifest.json" ]; then
+        mfile="$here/manifests/$manifest.json"
+    elif [ -f "$here/manifests/$manifest.yml" ]; then
+        mfile="$here/manifests/$manifest.yml"
+    else
+        echo "manifest not found: $manifest (looked in $here/manifests)" >&2; exit 2
+    fi
+
+    echo "==> resolving plan (manifest $manifest)"
+    set -- --manifest "$mfile" --facts "$work/facts" --host "$host"
+    if [ -n "$accept_risks" ]; then
+        set -- "$@" --accept-risk "$accept_risks"
+    fi
+    if [ -n "$mirror" ]; then
+        set -- "$@" --mirror "$mirror"
+    fi
+    python3 "$here/engine/preflight.py" plan "$@" > "$work/plan.json" || { echo "plan resolution failed" >&2; exit 1; }
+fi
+
+# --- key material: explicit, discovered, manifest-declared ----------------------
+# authorized_keys lines only, comments/blank stripped, deduped across sources.
+: > "$work/keys"
+key_sources=
+if [ -n "$key" ]; then
+    "$here/engine/merge-key-files.sh" "$work/keys" "$key"
+    key_sources="--key $key"
+    if [ ! -s "$work/keys" ]; then
+        echo "no valid public key lines found in $key" >&2; exit 2
+    fi
+else
+    # carry forward exactly the access that already reaches this machine:
+    # the invoking user's authorized_keys plus root's (when different). Public
+    # keys are not secret; copying root's public key file into the work dir is
+    # only a convenience for merge/dedupe and never exposes private material.
+    : > "$work/root_authorized_keys"
+    if [ "$(id -u)" != 0 ]; then
+        $SUDO cat /root/.ssh/authorized_keys 2>/dev/null > "$work/root_authorized_keys" || true
+    fi
+    "$here/engine/merge-key-files.sh" "$work/keys" \
+        "$HOME/.ssh/authorized_keys" "$work/root_authorized_keys"
+    key_sources="carried forward from this machine's authorized_keys"
+fi
+carried_keys=$(awk 'END {print NR}' "$work/keys" 2>/dev/null || echo 0)
+carried_keys=${carried_keys:-0}
+
+if [ "$cmd" = rescue ]; then
+    auth_summary=rescue
+    if [ "$carried_keys" -eq 0 ] && [ -z "$console_only" ]; then
+        echo "REFUSING: rescue mode has no SSH keys and --console-only was not passed — pass --key, ensure authorized_keys exists, or pass --console-only if you have provider console access" >&2
+        exit 1
+    fi
+elif [ "$cmd" = check ]; then
+    # auth-mode assessment in read-only check mode (install mode re-checks
+    # after optional/desktop per-install password setup).
+    auth_summary=$(python3 "$here/engine/auth-summary.py" "$work/plan.json" "$carried_keys")
+    case "$auth_summary" in
+        *FATAL*)
+            echo "REFUSING: no authentication material exists for the reinstalled machine —" >&2
+            echo "no --key, nothing in this machine's authorized_keys files, and the manifest" >&2
+            echo "declares neither user keys nor a password. installing a machine you cannot" >&2
+            echo "log into is never the intent. pass --key or fix the manifest users." >&2
+            exit 1 ;;
+    esac
+fi
+
+# --- read-only check mode -------------------------------------------------------
+python3 - "$work/plan.json" <<'PY'
+import json
+import sys
+p = json.load(open(sys.argv[1]))
+artifact = p.get("artifact") or {}
+digest = artifact.get("checksum") or artifact.get("sha256") or ""
+alg = artifact.get("checksum_alg") or ("sha256" if digest else "")
+if p.get("mode") != "rescue":
+    print("source:")
+    print(f"  url: {artifact.get('url') or '<netboot>'}")
+    if artifact.get("source_index"):
+        print(f"  index: {artifact['source_index']}")
+    if digest:
+        print(f"  checksum: {alg}:{digest}")
+    if artifact.get("mirror_override"):
+        print(f"  mirror_override: {artifact['mirror_override']} (operator override)")
+print("support envelope:")
+for probe in p.get("envelope") or []:
+    print(f"  [{probe['status']:>4}] {probe['name']}: {probe['note']}")
+accepted = p.get("accepted_risks") or []
+if accepted:
+    print(f"accepted_risks: {','.join(accepted)}")
+PY
+python3 "$here/engine/preflight.py" check --plan "$work/plan.json" || {
+    echo "preflight check failed — see BLOCKER/ENVELOPE-FAIL lines above" >&2
+    exit 1
+}
+if [ "$cmd" = check ]; then
+    if [ -f "$here/engine/dhcp_probe.py" ]; then
+        net_if=$(sed -n 's/^net_if=//p' "$work/facts" | head -1)
+        net_mac=$(sed -n 's/^net_mac=//p' "$work/facts" | head -1)
+        if [ -n "$net_if" ] && [ -n "$net_mac" ] && [ "$net_mac" != none ]; then
+            dhcp_avail=$($SUDO python3 "$here/engine/dhcp_probe.py" \
+                --iface "$net_if" --mac "$net_mac" --timeout 1.5 --retries 1 2>/dev/null || echo unknown)
+            echo "dhcp_available: ${dhcp_avail:-unknown}"
+        fi
+    fi
+    echo "check complete: machine facts, plan fit and envelope probed — nothing was mutated"
+    exit 0
+fi
+
+# --- rescue review + non-destructive staging -----------------------------------
+if [ "$cmd" = rescue ]; then
+    python3 - "$work/plan.json" "$carried_keys" "$key_sources" "$console_only" <<'PY'
+import json
+import sys
+p = json.load(open(sys.argv[1]))
+carried = int(sys.argv[2])
+sources = sys.argv[3]
+console_only = bool(sys.argv[4])
+print()
+print("Rescue review:")
+print(f"  host={p['host']} disk={p['facts']['disk_path']}"
+      f" size={int(p['facts']['disk_size_bytes']) // (1024 ** 3)}GiB")
+print(f"  fingerprint={p['fingerprint']}")
+accepted = p.get("accepted_risks") or []
+if accepted:
+    print(f"  accepted_risks={','.join(accepted)} (explicit operator override)")
+if carried:
+    suffix = f" ({sources})" if sources else ""
+    print(f"  ssh_rescue_keys={carried} key(s){suffix}")
+elif console_only:
+    print("  ssh_rescue_keys=none (console-only access explicitly acknowledged)")
+print("  one_shot_grub=BOOTIE rescue (one-shot); prior OS remains the saved default")
+print("  NON-DESTRUCTIVE: no OS image or write command will be staged; rebooting returns to the prior OS unchanged")
+print()
+print(f"Confirmation token: {p['approval']}")
+PY
+    approval=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["approval"])' "$work/plan.json")
+    echo "Type the confirmation token exactly to authorize staging rescue mode:"
+    prompt_read "" && typed_approval=$REPLY || typed_approval=
+    [ "$typed_approval" = "$approval" ] || {
+        echo "confirmation did not match; rescue staging was not run" >&2; exit 1; }
+
+    echo "==> staging rescue environment"
+    staging=/usr/local/share/bootie-rescue
+    if [ -d "$staging" ]; then
+        $SUDO rm -rf "$staging"
+    fi
+    $SUDO mkdir -p "$staging"
+
+    # Dropbear initramfs keys go in BEFORE installing dropbear-initramfs so
+    # the package hook sees valid authorized_keys on its first run. Empty key
+    # material means the explicitly acknowledged console-only rescue path.
+    if [ -s "$work/keys" ]; then
+        if [ -d /etc/dropbear/initramfs ] || $SUDO mkdir -p /etc/dropbear/initramfs; then
+            $SUDO cp "$work/keys" /etc/dropbear/initramfs/authorized_keys
+            $SUDO chmod 600 /etc/dropbear/initramfs/authorized_keys
+        fi
+    fi
+
+    pkgs=$(python3 -c 'import json,sys; print(" ".join(json.load(open(sys.argv[1]))["liveenv"].get("packages") or []))' "$work/plan.json")
+    if [ -n "$pkgs" ]; then
+        echo "installing rescue live env packages: $pkgs"
+        if ! $SUDO env DEBIAN_FRONTEND=noninteractive apt-get update -qq; then
+            echo "rescue live env package install failed" >&2; exit 1
+        fi
+        # Intentional word splitting: package names are a space-separated apt list.
+        # shellcheck disable=SC2086
+        $SUDO env DEBIAN_FRONTEND=noninteractive apt-get install -y $pkgs || {
+            echo "rescue live env package install failed" >&2; exit 1; }
+    fi
+
+    # Re-sync after package installation in case the package created or reset
+    # /etc/dropbear/initramfs.
+    if [ -s "$work/keys" ]; then
+        if [ -d /etc/dropbear/initramfs ] || $SUDO mkdir -p /etc/dropbear/initramfs; then
+            $SUDO cp "$work/keys" /etc/dropbear/initramfs/authorized_keys
+            $SUDO chmod 600 /etc/dropbear/initramfs/authorized_keys
+        fi
+    fi
+
+    # The rescue staging tree is deliberately separate from /usr/local/share/bootie:
+    # no install plan.env, payload, liveenv write engine, or autostart is copied here.
+    $SUDO cp "$here/engine/facts.sh" "$here/engine/rescue-helper.sh" "$staging/"
+    $SUDO chmod 755 "$staging/facts.sh" "$staging/rescue-helper.sh"
+
+    python3 - "$work/plan.json" > "$work/rescue.env" <<'PY'
+import json
+import sys
+
+def q(value):
+    return "'" + str(value).replace("'", "'\\''") + "'"
+
+p = json.load(open(sys.argv[1]))
+facts = p["facts"]
+lines = [
+    f"HOSTNAME_V={q(facts.get('hostname') or p.get('host') or '')}",
+    f"PLAN_DISK={q(facts['disk_path'])}",
+    f"FP_EXPECTED={q(p['fingerprint'])}",
+    f"NET_IF={q(facts['net_if'])}",
+    f"IPV4_ADDR={q(facts['ipv4_addr'])}",
+    f"IPV4_GW={q(facts['ipv4_gateway'])}",
+    f"IPV6_ADDR={q(facts.get('ipv6_addr', ''))}",
+    f"IPV6_GW={q(facts.get('ipv6_gateway', ''))}",
+    f"DNS={q(facts.get('dns') or '8.8.8.8')}",
+]
+sys.stdout.write("\n".join(lines) + "\n")
+PY
+    chmod 600 "$work/rescue.env"
+    $SUDO cp "$work/rescue.env" "$staging/rescue.env"
+    $SUDO chmod 600 "$staging/rescue.env"
+
+    # Dedicated rescue hook only. The install hook and autostart boot script are
+    # neither copied nor modified by rescue mode.
+    $SUDO cp "$here/engine/rescue-hook.sh" /etc/initramfs-tools/hooks/bootie-rescue
+    $SUDO chmod 755 /etc/initramfs-tools/hooks/bootie-rescue
+    kernel=$(uname -r)
+    echo "building rescue initramfs for kernel $kernel"
+    $SUDO mkinitramfs -o /boot/initrd-bootie-rescue.img "$kernel" || {
+        echo "mkinitramfs failed" >&2; exit 1; }
+
+    ipcmd=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("ip_cmdline", ""))' "$work/plan.json")
+    kcmd=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["liveenv"].get("kernel_cmdline", ""))' "$work/plan.json")
+    rootdev=$(sed -n 's/.*root=\([^ ]*\).*/\1/p' /proc/cmdline | head -1)
+    [ -n "$rootdev" ] || { echo "cannot determine root= from /proc/cmdline — refusing to write a broken boot entry" >&2; exit 1; }
+    {
+        echo '#!/bin/sh'
+        # Literal text for the generated GRUB script; do not expand $0 here.
+        # shellcheck disable=SC2016
+        echo 'exec tail -n +3 $0'
+        echo "menuentry 'BOOTIE rescue (one-shot)' --class debian {"
+        echo "    linux $grub_boot_prefix/vmlinuz-$kernel root=$rootdev $kcmd $ipcmd"
+        echo "    initrd $grub_boot_prefix/initrd-bootie-rescue.img"
+        echo "}"
+    } | $SUDO tee /etc/grub.d/41_bootie_rescue >/dev/null
+    $SUDO chmod 755 /etc/grub.d/41_bootie_rescue
+    if [ -f /etc/default/grub ] && $SUDO grep -q '^GRUB_DEFAULT=' /etc/default/grub; then
+        $SUDO sed -i 's/^GRUB_DEFAULT=.*/GRUB_DEFAULT=saved/' /etc/default/grub
+    else
+        echo 'GRUB_DEFAULT=saved' | $SUDO tee -a /etc/default/grub >/dev/null
+    fi
+    echo "regenerating grub.cfg and arming the rescue one-shot entry"
+    $SUDO update-grub >/dev/null 2>&1 || $SUDO grub2-mkconfig -o /boot/grub/grub.cfg >/dev/null 2>&1 || {
+        echo "grub config regeneration failed" >&2; exit 1; }
+    $SUDO "$grub_reboot" 'BOOTIE rescue (one-shot)' || {
+        echo "arming the rescue one-shot boot entry failed" >&2; exit 1; }
+
+    target_ip=$(sed -n 's/^ipv4_addr=//p' "$work/facts" | head -1 | cut -d/ -f1)
+    cat <<EOF
+
+==> rescue staged. what happens next:
+  1. this machine reboots into the non-destructive RAM rescue environment
+     (your session dies — expected)
+  2. connect with the carried SSH keys:
+       ssh root@$target_ip
+     or use the provider console when --console-only was acknowledged
+  3. inspect facts and disks read-only:
+       /bootie-rescue/rescue-helper.sh info
+  4. when finished, return to the prior OS unchanged:
+       /bootie-rescue/rescue-helper.sh return
+  5. back in the prior OS, remove rescue staging:
+       sh bootie.sh rescue --clean
+  no OS image or write command was staged. rebooting before any manual disk
+  operation returns to the prior OS unchanged.
+EOF
+    if [ -n "$no_reboot" ]; then
+        echo "--no-reboot given: reboot manually when ready (grub-reboot is armed once)"
+        exit 0
+    fi
+    echo "rebooting in 5 seconds — ctrl-c to abort (rescue staging is non-destructive)"
+    sleep 5
+    sync
+    $SUDO reboot
+    exit 0
+fi
+
+# --- operator review + one typed approval ---------------------------------------
+generated_pw_file=
+generated_pw_user=
+if [ -n "$password_file" ]; then
+    pw_first_line=$(head -n 1 "$password_file" | tr -d '\r\n')
+    [ -n "$pw_first_line" ] || { echo "password file is empty: $password_file" >&2; exit 2; }
+    printf '%s\n' "$pw_first_line" | python3 "$here/engine/password.py" apply --plan "$work/plan.json" >/dev/null || {
+        echo "failed to apply password from $password_file" >&2; exit 1; }
+    pw_first_line=
+elif [ -n "$password_prompt" ]; then
+    pw_user=$(python3 "$here/engine/password.py" target-user --plan "$work/plan.json") || {
+        echo "cannot determine target user for --password" >&2; exit 1; }
+    printf 'Password for %s (leave blank to auto-generate a 10-char password): ' "$pw_user" >&2
+    bootie_prompt_secret || { echo "password prompt aborted; nothing mutating was run" >&2; exit 1; }
+    pw_entered=$REPLY
+    if [ -z "$pw_entered" ]; then
+        pw_gen=$(python3 "$here/engine/password.py" generate) || {
+            echo "failed to generate password" >&2; exit 1; }
+        generated_pw_user=$(printf '%s\n' "$pw_gen" | python3 "$here/engine/password.py" apply --plan "$work/plan.json") || {
+            echo "failed to apply generated password" >&2; exit 1; }
+        generated_pw_file="$work/generated.pw"
+        ( umask 077; printf '%s\n' "$pw_gen" > "$generated_pw_file" )
+        pw_gen=
+    else
+        printf 'Confirm password for %s: ' "$pw_user" >&2
+        bootie_prompt_secret || { echo "password confirmation aborted; nothing mutating was run" >&2; exit 1; }
+        pw_confirm=$REPLY
+        if [ "$pw_entered" != "$pw_confirm" ]; then
+            pw_entered=; pw_confirm=
+            echo "passwords did not match; nothing mutating was run" >&2
+            exit 1
+        fi
+        printf '%s\n' "$pw_entered" | python3 "$here/engine/password.py" apply --plan "$work/plan.json" >/dev/null || {
+            pw_entered=; pw_confirm=
+            echo "failed to apply password" >&2; exit 1; }
+        pw_entered=; pw_confirm=
+    fi
+else
+    auto_pw_user=$(python3 "$here/engine/password.py" needs-auto --plan "$work/plan.json") || auto_pw_user=
+    if [ -n "$auto_pw_user" ]; then
+        pw_gen=$(python3 "$here/engine/password.py" generate) || {
+            echo "failed to generate per-install desktop password" >&2; exit 1; }
+        generated_pw_user=$(printf '%s\n' "$pw_gen" | python3 "$here/engine/password.py" apply --plan "$work/plan.json") || {
+            echo "failed to apply per-install desktop password" >&2; exit 1; }
+        generated_pw_file="$work/generated.pw"
+        ( umask 077; printf '%s\n' "$pw_gen" > "$generated_pw_file" )
+        pw_gen=
+    fi
+fi
+
+# auth-mode assessment: carried keys + manifest-declared/install keys & passwords.
+# fail closed when the machine would come up with no way in at all.
+auth_summary=$(python3 "$here/engine/auth-summary.py" "$work/plan.json" "$carried_keys")
+case "$auth_summary" in
+    *FATAL*)
+        echo "REFUSING: no authentication material exists for the reinstalled machine —" >&2
+        echo "no --key, nothing in this machine's authorized_keys files, and the manifest" >&2
+        echo "declares neither user keys nor a password. installing a machine you cannot" >&2
+        echo "log into is never the intent. pass --key, --password, or fix the manifest users." >&2
+        exit 1 ;;
+esac
+
+BOOTIE_GENERATED_PW_FILE="$generated_pw_file" BOOTIE_GENERATED_PW_USER="$generated_pw_user" \
+python3 - "$work/plan.json" "$carried_keys" "$key_sources" "$auth_summary" <<'PY'
+import json
+import os
+import sys
+p, carried, sources, auth = json.load(open(sys.argv[1])), int(sys.argv[2]), sys.argv[3], sys.argv[4]
+print()
+print("Review before destruction:")
+print(f"  host={p['host']} manifest={p['manifest']['name']}-{p['manifest']['version']}"
+      f" disk={p['facts']['disk_path']} size={int(p['facts']['disk_size_bytes']) // (1024 ** 3)}GiB")
+print(f"  fingerprint={p['fingerprint']}")
+artifact = p.get("artifact") or {}
+print(f"  artifact={artifact.get('url') or '<netboot>'}")
+if artifact.get("source_index"):
+    print(f"  source_index={artifact['source_index']}")
+digest = artifact.get("checksum") or artifact.get("sha256") or ""
+alg = artifact.get("checksum_alg") or ("sha256" if digest else "")
+if digest:
+    print(f"  source_checksum={alg}:{digest}")
+if artifact.get("mirror_override"):
+    print(f"  mirror_override={artifact['mirror_override']} (explicit operator override)")
+cloud_ops = p.get("cloud_ops") or {}
+print(f"  locale={cloud_ops.get('locale') or 'en_US.UTF-8'}")
+print(f"  timezone={cloud_ops.get('timezone') or '<image-default>'}")
+print(f"  boot_target={p.get('postinstall', {}).get('boot_target', 'desktop')}"
+      f" managed_user={p.get('postinstall', {}).get('managed_user', '<none>')}")
+accepted = p.get("accepted_risks") or []
+if accepted:
+    print(f"  accepted_risks={','.join(accepted)} (explicit operator override)")
+users = cloud_ops.get("users") or []
+usernames = [u.get("name") or "<unnamed>" for u in users]
+password_users = [
+    u.get("name") or "<unnamed>" for u in users
+    if u.get("passwd") and not u.get("lock_passwd")
+]
+mkeys = sum(len(u.get("keys") or []) for u in users)
+print(f"  users={','.join(usernames) if usernames else '<none>'}")
+print(f"  access: {carried} carried key(s){' (' + sources + ')' if sources and carried else ''}"
+      f" + {mkeys} manifest-declared key(s)")
+rescue = f"enabled ({carried} key(s))" if carried else "disabled (console only)"
+print(f"  liveenv_rescue_ssh: {rescue}")
+if password_users:
+    print(f"  password_auth={','.join(password_users)}")
+gen_pw_file = os.environ.get("BOOTIE_GENERATED_PW_FILE") or ""
+gen_pw_user = os.environ.get("BOOTIE_GENERATED_PW_USER") or ""
+if gen_pw_file and os.path.isfile(gen_pw_file):
+    gen_pw = open(gen_pw_file).read().strip()
+    if gen_pw:
+        label = gen_pw_user or (password_users[0] if password_users else "user")
+        print(f"  generated_password ({label}): {gen_pw}"
+              "  (save this — for sudo/desktop login; pass --password to choose your own)")
+if password_users and (carried + mkeys) > 0:
+    print("  ssh_password_auth=disabled (SSH remains key-only; password is for sudo and desktop/console login)")
+if "password-only" in auth:
+    print("  WARNING: password/console-only access — the liveenv rescue shell is")
+    print("           unreachable over ssh; a failed write means console recovery")
+elif "key" not in auth:
+    print(f"  WARNING: unusual auth shape ({auth})")
+print()
+print(f"Approval token: {p['approval']}")
+PY
+[ -n "$generated_pw_file" ] && rm -f "$generated_pw_file" || true
+approval=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["approval"])' "$work/plan.json")
+echo "Type the approval token exactly to authorize erasing this machine:"
+prompt_read "" && typed_approval=$REPLY || typed_approval=
+[ "$typed_approval" = "$approval" ] || {
+    echo "approval did not match; nothing mutating was run" >&2; exit 1; }
+
+# --- stage ----------------------------------------------------------------------
+echo "==> staging live env"
+staging=/usr/local/share/bootie
+$SUDO mkdir -p "$staging"
+
+# dropbear initramfs keys — stage BEFORE installing dropbear-initramfs so its
+# package hook finds a valid authorized_keys file on first run instead of
+# warning that SSH login to initramfs won't work. Empty means no ssh rescue
+# path in the live env (console only) — the review already stated that plainly.
+if [ -s "$work/keys" ]; then
+    if [ -d /etc/dropbear/initramfs ] || $SUDO mkdir -p /etc/dropbear/initramfs; then
+        $SUDO cp "$work/keys" /etc/dropbear/initramfs/authorized_keys
+        $SUDO chmod 600 /etc/dropbear/initramfs/authorized_keys
+    fi
+fi
+
+# live env packages from the plan (dropbear-initramfs, qemu-img, ...)
+pkgs=$(python3 -c 'import json,sys; print(" ".join(json.load(open(sys.argv[1]))["liveenv"].get("packages") or []))' "$work/plan.json")
+if [ "$firmware" = uefi ]; then
+    case " $pkgs " in
+        *" efibootmgr "*) ;;
+        *) pkgs="${pkgs:+$pkgs }efibootmgr" ;;
+    esac
+fi
+if [ -n "$pkgs" ]; then
+    echo "installing live env packages: $pkgs"
+    if ! $SUDO env DEBIAN_FRONTEND=noninteractive apt-get update -qq; then
+        echo "live env package install failed" >&2; exit 1
+    fi
+    # Intentional word splitting: package names are a space-separated apt list.
+    # shellcheck disable=SC2086
+    $SUDO env DEBIAN_FRONTEND=noninteractive apt-get install -y $pkgs || {
+        echo "live env package install failed" >&2; exit 1; }
+fi
+
+# re-ensure dropbear initramfs keys after package install in case the package
+# created or reset /etc/dropbear/initramfs.
+if [ -s "$work/keys" ]; then
+    if [ -d /etc/dropbear/initramfs ] || $SUDO mkdir -p /etc/dropbear/initramfs; then
+        $SUDO cp "$work/keys" /etc/dropbear/initramfs/authorized_keys
+        $SUDO chmod 600 /etc/dropbear/initramfs/authorized_keys
+    fi
+fi
+
+# engine + plan-driven payload
+$SUDO mkdir -p "$staging/engine"
+$SUDO cp "$here/engine/facts.sh" "$here/engine/liveenv.sh" "$staging/engine/"
+$SUDO chmod 755 "$staging/engine/facts.sh" "$staging/engine/liveenv.sh"
+python3 "$here/engine/stage.py" --plan "$work/plan.json" --key "$work/keys" --dest "$work/staging"
+$SUDO cp -a "$work/staging/." "$staging/"
+# static payload assets (om-desktop)
+[ -f "$here/payload/om-desktop" ] && $SUDO cp "$here/payload/om-desktop" "$staging/payload/om-desktop"
+# target-resident autostart: the initramfs hook turns this flag into a
+# self-launching boot script — the destructive sequence needs no session.
+mode=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["liveenv"].get("mode", "hold"))' "$work/plan.json")
+if [ "$mode" = auto ]; then
+    $SUDO touch "$staging/autostart"
+else
+    $SUDO rm -f "$staging/autostart"
+fi
+$SUDO chmod 600 "$staging/plan.env"
+
+# initramfs hook + boot script + build. the autostart boot script must live
+# in the host's scripts tree BEFORE mkinitramfs — ORDER registration scans
+# /etc/initramfs-tools/scripts, not files a hook drops into $DESTDIR.
+$SUDO cp "$here/engine/initramfs-hook.sh" /etc/initramfs-tools/hooks/bootie-live
+$SUDO chmod 755 /etc/initramfs-tools/hooks/bootie-live
+$SUDO mkdir -p /etc/initramfs-tools/scripts/init-premount
+$SUDO cp "$here/engine/initramfs-autostart.sh" /etc/initramfs-tools/scripts/init-premount/bootie_autostart
+$SUDO chmod 755 /etc/initramfs-tools/scripts/init-premount/bootie_autostart
+kernel=$(uname -r)
+echo "building live env initramfs for kernel $kernel"
+$SUDO mkinitramfs -o /boot/initrd-bootie.img "$kernel" || {
+    echo "mkinitramfs failed" >&2; exit 1; }
+
+# one-shot grub entry
+ipcmd=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("ip_cmdline", ""))' "$work/plan.json")
+kcmd=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["liveenv"].get("kernel_cmdline", ""))' "$work/plan.json")
+rootdev=$(sed -n 's/.*root=\([^ ]*\).*/\1/p' /proc/cmdline | head -1)
+[ -n "$rootdev" ] || { echo "cannot determine root= from /proc/cmdline — refusing to write a broken boot entry" >&2; exit 1; }
+{
+    echo '#!/bin/sh'
+    # Literal text for the generated GRUB script; do not expand $0 here.
+    # shellcheck disable=SC2016
+    echo 'exec tail -n +3 $0'
+    echo "menuentry 'BOOTIE liveenv (one-shot)' --class debian {"
+    echo "    linux $grub_boot_prefix/vmlinuz-$kernel root=$rootdev $kcmd $ipcmd"
+    echo "    initrd $grub_boot_prefix/initrd-bootie.img"
+    echo "}"
+} | $SUDO tee /etc/grub.d/41_bootie >/dev/null
+$SUDO chmod 755 /etc/grub.d/41_bootie
+if $SUDO grep -q '^GRUB_DEFAULT=' /etc/default/grub; then
+    $SUDO sed -i 's/^GRUB_DEFAULT=.*/GRUB_DEFAULT=saved/' /etc/default/grub
+else
+    echo 'GRUB_DEFAULT=saved' | $SUDO tee -a /etc/default/grub >/dev/null
+fi
+echo "regenerating grub.cfg and arming the one-shot entry"
+$SUDO update-grub >/dev/null 2>&1 || $SUDO grub2-mkconfig -o /boot/grub/grub.cfg >/dev/null 2>&1 || {
+    echo "grub config regeneration failed" >&2; exit 1; }
+$SUDO "$grub_reboot" 'BOOTIE liveenv (one-shot)' || {
+    echo "arming the one-shot boot entry failed" >&2; exit 1; }
+
+target_ip=$(sed -n 's/^ipv4_addr=//p' "$work/facts" | head -1 | cut -d/ -f1)
+managed_user=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("postinstall", {}).get("managed_user", "root"))' "$work/plan.json")
+runcmd_count=$(python3 -c 'import json,sys; print(len((json.load(open(sys.argv[1])).get("cloud_ops") or {}).get("runcmd") or []))' "$work/plan.json")
+if [ "$mode" = auto ]; then
+    echo ""
+    echo "==> staged (mode=auto). what happens next:"
+    echo "  1. this machine reboots into the RAM live env (your session dies — expected)"
+    echo "  2. unattended: write -> personalize -> in-env verify -> reboot into new OS"
+    if [ "${runcmd_count:-0}" -gt 0 ]; then
+        echo "  3. first boot: run manifest firstboot tasks (e.g. system upgrade when"
+        echo "     reachable), then a final reboot if an upgrade completed"
+        echo "  4. ssh back in as the managed user when it is over:"
+    else
+        echo "  3. ssh back in as the managed user when it is over:"
+    fi
+    cat <<EOF
+       ssh $managed_user@$target_ip
+  point of no return: once the write starts, the old OS is gone. before the
+  write, a reboot returns to this OS unchanged.
+EOF
+else
+    cat <<EOF
+
+==> staged (mode=hold). what happens next:
+  1. this machine reboots into the RAM live env (your session dies — expected)
+  2. no automatic disk write will run in hold mode
+  3. connect to the live env over dropbear ssh (if keys were carried) or
+     provider console to inspect status or drive phases manually:
+       ssh root@$target_ip
+       /bootie/engine/liveenv.sh status
+  4. rebooting without running 'write' returns to this OS unchanged.
+EOF
+fi
+if [ -n "$no_reboot" ]; then
+    echo "--no-reboot given: reboot manually when ready (grub-reboot is armed once)"
+    exit 0
+fi
+echo "rebooting in 5 seconds — ctrl-c to abort (nothing destructive has happened)"
+sleep 5
+sync
+$SUDO reboot

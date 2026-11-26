@@ -1,0 +1,34 @@
+#!/bin/sh
+# Cheap generated-artifact smoke tests. These verify that the heredoc payload
+# extracts in both supported execution shapes; they do not run install logic.
+set -eu
+
+cd "$(dirname "$0")/.."
+tmp=$(mktemp -d "${TMPDIR:-/tmp}/bootie-bundle-test.XXXXXX")
+trap 'rm -rf "$tmp"' EXIT
+out="$tmp/bootie.sh"
+
+scripts/bundle "$out" >/dev/null
+
+grep -q "__BOOTIE_PAYLOAD__" "$out"
+# The generated-artifact regression pattern must keep a literal backslash-dollar.
+# shellcheck disable=SC2016
+if grep -q 'tail -n +\$line' "$out"; then
+    echo "generated artifact uses seekable tail extraction; pipe mode would break" >&2
+    exit 1
+fi
+
+file_version=$(sh "$out" version)
+pipe_version=$(cat "$out" | sh -s version)
+[ -n "$file_version" ]
+[ "$file_version" = "$pipe_version" ] || {
+    echo "file/pipe version mismatch: $file_version vs $pipe_version" >&2
+    exit 1
+}
+
+case "$file_version" in
+    "bootie "*) ;;
+    *) echo "unexpected version output: $file_version" >&2; exit 1 ;;
+esac
+
+echo "bundle smoke ok: $file_version (file-mode and pipe-mode extraction)"

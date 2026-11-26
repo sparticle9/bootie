@@ -1,0 +1,104 @@
+# Opinionated example: console-first Omarchy coding-agent workspace.
+#
+# This is NOT the generic default. It creates an additional `agent` user with
+# passwordless sudo because unattended coding-agent harnesses commonly need it.
+# Review that privilege before use and edit or remove the user if it does not
+# match your security policy. No credentials or network enrollment tokens are
+# embedded here.
+manifest_version: 2
+name: omarchy
+version: "4.5.0"
+channel: stable
+arch: x86_64
+x-example: console-first-coding-workspace
+
+artifact:
+  kind: disk-image
+  index_url: https://nightly.omarchy.org/stable/latest.json
+  requires:
+    arch: x86_64
+    virtual_size_max_gib: 48
+    min_size_gib: 40
+
+target:
+  disk_min_size_gib: 45
+  memory_min_mib: 2048
+  firmware: [bios, uefi]
+
+liveenv:
+  kind: debian-initramfs
+  packages:
+    - busybox-static
+    - dropbear-initramfs
+    - openssh-client
+    - curl
+    - qemu-utils
+    - qemu-block-extra
+    - btrfs-progs
+    - dosfstools
+    - fdisk
+    - gdisk
+  kernel_cmdline: "break=mount console=ttyS0,115200 console=tty0"
+  ssh_port: 22
+  mode: auto
+
+write:
+  method: qemu-img-stream
+  scrub_after: true
+
+personalize:
+  root_subvol: "@"
+  esp_subvol: null
+  network: networkmanager
+  ssh_host_keys: pregenerate
+  bios_boot: limine
+  remove_webapps: []
+  drop_pkgs: []
+  late_commands: []
+
+firstboot:
+  grow_partition: true
+  btrfs_resize: true
+
+cloud_config:
+  users:
+    - name: omarchy
+      lock_passwd: true
+      ssh_authorized_keys: []
+    - name: agent
+      groups: [wheel]
+      shell: /bin/bash
+      sudo: "ALL=(ALL) NOPASSWD: ALL"
+      lock_passwd: true
+      ssh_authorized_keys: []
+  packages:
+    - git
+    - tmux
+  package_update: false
+  runcmd:
+    - >-
+      if curl -sf --connect-timeout 10 --max-time 20 --retry 2 --retry-delay 2 -o /dev/null https://archlinux.org/; then
+        echo 'internet reachable; running first-boot Omarchy system upgrade';
+        export OMARCHY_UPDATE_UNATTENDED=1;
+        if ! omarchy-update-keyring || ! omarchy-update-system-pkgs; then
+          exit 1;
+        fi;
+        if [ ! -d /sys/firmware/efi ]; then
+          machine_id=$(cat /etc/machine-id);
+          kernel_bootdir="/boot/$machine_id/linux-omarchy";
+          if [ ! -f "$kernel_bootdir/vmlinuz" ] || [ ! -f "$kernel_bootdir/initramfs" ]; then
+            echo "limine-entry-tool kernel files missing under $kernel_bootdir" >&2;
+            exit 1;
+          fi;
+          cp "$kernel_bootdir/vmlinuz" /boot/vmlinuz || exit 1;
+          cp "$kernel_bootdir/initramfs" /boot/initrd || exit 1;
+        fi;
+        mkdir -p /var/lib/bootie && touch /var/lib/bootie/firstboot-system-upgrade-ok;
+      else
+        echo 'internet unreachable; skipping first-boot Omarchy system upgrade';
+      fi
+
+postinstall:
+  managed_user: agent
+  install_om_desktop: true
+  boot_target: console       # desktop remains available through om-desktop

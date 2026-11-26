@@ -1,0 +1,66 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d # v10.4.0
+        with:
+          version: "latest-known"
+          require-checksums: true
+          python-version: "3.12"
+          # The only Python dependency is small; avoid cache storage and API overhead.
+          enable-cache: false
+
+      - name: Install locked Python dependencies
+        run: uv sync --locked
+
+      - name: Verify runner ShellCheck
+        # Included in the GitHub-hosted Ubuntu image; do not run apt in CI.
+        run: shellcheck --version
+
+      - name: Verify generated artifact is not tracked
+        run: |
+          if git ls-files --error-unmatch bootie.sh >/dev/null 2>&1; then
+            echo "bootie.sh is a generated release artifact and must not be tracked" >&2
+            exit 1
+          fi
+
+      - name: Check shell syntax
+        run: |
+          set -eu
+          for f in bootie-main engine/*.sh scripts/test-bundle; do
+            dash -n "$f"
+          done
+          bash -n scripts/bundle payload/om-desktop
+
+      - name: Run shellcheck
+        run: |
+          shellcheck -S info -s sh bootie-main engine/*.sh scripts/test-bundle
+          shellcheck -S info -s bash scripts/bundle payload/om-desktop
+
+      - name: Compile Python sources
+        run: uv run --locked python -m compileall -q engine tests
+
+      - name: Run unit tests
+        run: uv run --locked python -m unittest discover -s tests -v
+
+      - name: Run bundle smoke tests
+        run: uv run --locked sh scripts/test-bundle

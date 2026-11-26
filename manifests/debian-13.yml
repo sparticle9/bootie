@@ -1,0 +1,73 @@
+# Debian 13 (trixie) — official generic cloud qcow2 server image.
+#
+# Resolved artifacts come from Debian's upstream cloud-image checksum index;
+# nothing is mirrored, repacked, or hosted by bootie. The target streams the
+# qcow2 from upstream directly to its disk at write time.
+manifest_version: 2
+name: debian
+version: "13"
+arch: x86_64
+x-codename: trixie
+
+artifact:
+  kind: disk-image
+  checksums_url: https://cloud.debian.org/images/cloud/trixie/latest/SHA512SUMS
+  image_file: debian-13-generic-amd64.qcow2
+  checksum_alg: sha512
+  requires:
+    arch: x86_64
+    min_size_gib: 8
+
+target:
+  disk_min_size_gib: 10
+  memory_min_mib: 1024
+  firmware: [bios, uefi]
+
+liveenv:
+  kind: debian-initramfs
+  packages:
+    - busybox-static
+    - dropbear-initramfs      # SSH-into-initramfs rescue path when keys exist
+    - openssh-client          # ssh-keygen for pre-generating target host keys
+    - curl
+    - qemu-utils              # qemu-img binary
+    - qemu-block-extra        # block-curl.so — the HTTPS driver (dlopen'd)
+    - e2fsprogs               # ext4 filesystem check/resize verification
+    - dosfstools              # ESP (FAT32) mount/check
+    - fdisk                   # sfdisk partition inspection/grow
+    - gdisk                   # sgdisk — move backup GPT to disk end
+  kernel_cmdline: "break=mount console=ttyS0,115200 console=tty0"
+  ssh_port: 22
+  mode: auto                  # target-resident write→personalize→verify→osboot
+
+write:
+  method: qemu-img-stream
+  scrub_after: false          # ext4 verification uses e2fsck, not btrfs scrub
+
+personalize:
+  rootfs: ext4
+  network: systemd-networkd
+  ssh_host_keys: pregenerate
+  bios_boot: image-native
+  connectivity_host: deb.debian.org
+  late_commands: []
+
+firstboot:
+  grow_partition: true
+  btrfs_resize: false
+
+cloud_config:
+  users:
+    - name: debian
+      groups: [sudo]
+      shell: /bin/bash
+      sudo: "ALL=(ALL) NOPASSWD: ALL"
+      lock_passwd: true
+      ssh_authorized_keys: []
+  packages: []
+  package_update: false
+
+postinstall:
+  managed_user: debian
+  boot_target: console
+  install_om_desktop: false
